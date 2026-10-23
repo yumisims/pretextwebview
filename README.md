@@ -44,4 +44,3 @@ trunk serve --release --address 127.0.0.1 --port 8080
 
 Open http://127.0.0.1:8080. `trunk build --release` writes the site to `dist/` without serving it.
 
-`index.html` copies `src/idOchAnnu3_RC-5104_normal.alg.pretext` into the site when that file is present. Without it, remove that `copy-file` line before building.
