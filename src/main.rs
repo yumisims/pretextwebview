@@ -8,11 +8,11 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
-            .with_title("PretextView"),
+            .with_title("pretextwebview"),
         ..Default::default()
     };
     eframe::run_native(
-        "PretextView",
+        "pretextwebview",
         options,
         Box::new(|cc| Ok(Box::new(app::PretextApp::new(cc)))),
     )
@@ -30,7 +30,7 @@ fn main() {
             .and_then(|window| window.document())
             .and_then(|document| document.get_element_by_id("loading_text"))
         {
-            loading.set_inner_html(&format!("PretextView panicked: {info}"));
+            loading.set_inner_html(&format!("pretextwebview panicked: {info}"));
         }
     }));
 
@@ -60,7 +60,7 @@ fn main() {
                     loading.remove();
                 }
                 Err(err) => {
-                    loading.set_inner_html(&format!("PretextView failed to start: {err:?}"));
+                    loading.set_inner_html(&format!("pretextwebview failed to start: {err:?}"));
                 }
             }
         }

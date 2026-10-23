@@ -356,11 +356,11 @@ impl Session {
             tooltip_bg: [32, 32, 32, 220],
             tooltip_size: 14.0,
             id_bars_on: true,
-            id_bar_size: 10.0,
-            labels_on: false,
-            label_fg: [255, 230, 120, 255],
-            label_bg: [32, 32, 32, 200],
-            label_size: 12.0,
+            id_bar_size: 4.0,
+            labels_on: true,
+            label_fg: [240, 185, 15, 255],
+            label_bg: [145, 140, 115, 255],
+            label_size: 16.0,
             scale_on: true,
             scale_fg: [220, 60, 60, 255],
             scale_bg: [32, 32, 32, 200],
@@ -538,6 +538,17 @@ impl Session {
             .filter(|(i, _)| meta & (1u64 << i) != 0)
             .map(|(_, name)| name.as_str())
             .collect()
+    }
+
+    pub fn summary_line(&self) -> String {
+        let mb = self.genome_bp as f64 / 1_000_000.0;
+        let px = self
+            .contacts
+            .as_ref()
+            .map(|contacts| contacts.overview_side)
+            .filter(|side| *side > 0)
+            .unwrap_or(self.map_pixels);
+        format!("{mb:.2} Mb · {} sequences · {px} px overview", self.fragments.len())
     }
 
     pub fn background_rgba(&self) -> [u8; 4] {
@@ -734,7 +745,32 @@ impl Session {
         false
     }
 
+    /// Remember the map so a grab can move more than once and still undo as one edit.
+    pub fn arm_edit(&mut self) {
+        self.begin_edit();
+    }
+
+    /// Drop an armed edit that never changed the map.
+    pub fn disarm_edit(&mut self) {
+        self.undo.pop();
+    }
+
+    pub fn note_edit(&mut self, summary: impl Into<String>) {
+        self.edits.push(EditRecord {
+            summary: summary.into(),
+        });
+    }
+
     pub fn place_uids(&mut self, uids: &[u64], dest_px: u32) -> Result<(), &'static str> {
+        self.relocate(uids, dest_px, true)
+    }
+
+    /// Move a block that was already stored with [`Self::arm_edit`].
+    pub fn place_armed(&mut self, uids: &[u64], dest_px: u32) -> Result<(), &'static str> {
+        self.relocate(uids, dest_px, false)
+    }
+
+    fn relocate(&mut self, uids: &[u64], dest_px: u32, record: bool) -> Result<(), &'static str> {
         if uids.is_empty() {
             return Err("nothing selected");
         }
@@ -758,7 +794,9 @@ impl Session {
         if dest_px >= start_px && dest_px < start_px + removed {
             return Err("place the selection outside itself");
         }
-        self.begin_edit();
+        if record {
+            self.begin_edit();
+        }
         let moving: Vec<_> = self.fragments.drain(start_i..=end_i).collect();
         let dest = if dest_px >= start_px + removed {
             dest_px - removed
@@ -767,12 +805,11 @@ impl Session {
         };
         self.split_at_pixel(dest);
         let insert_at = self.index_at_boundary(dest);
-        let summary = format!(
-            "moved {} fragment(s) to pixel {dest}",
-            moving.len()
-        );
+        let summary = format!("moved {} fragment(s) to pixel {dest}", moving.len());
         self.fragments.splice(insert_at..insert_at, moving);
-        self.edits.push(EditRecord { summary });
+        if record {
+            self.edits.push(EditRecord { summary });
+        }
         self.bump();
         debug_assert_eq!(self.total_pixels(), self.map_pixels);
         Ok(())
