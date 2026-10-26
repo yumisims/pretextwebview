@@ -38,7 +38,11 @@ pub const NAMES: &[&str] = &[
     "Yellow 1",
     "Yellow 2",
     "Copy_texture(always at end)",
+    "Fall",
 ];
+
+/// Yellow–orange–red ramp. The low end is pale, the high end is dark red.
+pub const FALL: usize = 35;
 
 pub fn sample(index: usize, t: f32) -> [u8; 4] {
     let t = t.clamp(0.0, 1.0);
@@ -60,6 +64,7 @@ pub fn sample(index: usize, t: f32) -> [u8; 4] {
             let g = (t * 255.0) as u8;
             [g, g, g]
         }
+        FALL => fall(t),
         n => named_ramp(n, t),
     };
     [r, g, b, 255]
@@ -90,6 +95,18 @@ fn named_ramp(index: usize, t: f32) -> [u8; 3] {
     lerp(lo, hi, u * u)
 }
 
+/// Pale at the bottom so a count of one is visible, dark red at the top.
+fn fall(t: f32) -> [u8; 3] {
+    let knee = 0.04;
+    if t <= knee {
+        return lerp([255, 248, 230], [255, 176, 56], t / knee);
+    }
+    stops(
+        (t - knee) / (1.0 - knee),
+        &[[255, 176, 56], [230, 96, 18], [170, 28, 8], [48, 6, 4]],
+    )
+}
+
 fn viridis(t: f32) -> [u8; 3] {
     stops(
         t,
@@ -118,6 +135,24 @@ fn stops(t: f32, colors: &[[u8; 3]]) -> [u8; 3] {
 fn lerp(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     let c = |i: usize| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8;
     [c(0), c(1), c(2)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fall_is_pale_at_the_bottom_and_dark_at_the_top() {
+        let low = sample(FALL, 0.0);
+        let floor = sample(FALL, 0.04);
+        let high = sample(FALL, 1.0);
+        let lum = |px: [u8; 4]| px[0] as u16 + px[1] as u16 + px[2] as u16;
+        assert_eq!(NAMES[FALL], "Fall");
+        assert!(low[0] > 240 && low[1] > 230, "low end {low:?}");
+        assert!(floor[0] > 240 && floor[1] > 140 && floor[2] < 80, "floor {floor:?}");
+        assert!(lum(low) > lum(high));
+        assert!(high[0] < 80 && high[1] < 30, "high end {high:?}");
+    }
 }
 
 /// PretextView gamma: three control points. `mid` is the value that maps to 0.5.

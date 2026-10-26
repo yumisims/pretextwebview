@@ -245,6 +245,8 @@ struct SavedState {
     edits: Vec<EditRecord>,
     camera: Camera,
     gamma: [f32; 3],
+    #[serde(default)]
+    signal: crate::yumi::SignalMethod,
     colormap: usize,
     tags: Vec<String>,
     grey_tags: Vec<bool>,
@@ -262,6 +264,7 @@ pub struct Session {
     redo: Vec<Hist>,
     pub camera: Camera,
     pub gamma: [f32; 3],
+    pub signal: crate::yumi::SignalMethod,
     pub colormap: usize,
     pub colormap_order: Vec<usize>,
     pub use_custom_colormap_order: bool,
@@ -333,6 +336,18 @@ fn overview_index(mapped: u32, side: u32, full: u32) -> usize {
 }
 
 impl Session {
+    /// Settings only. No contigs and no contact texture, so the window opens blank.
+    pub fn empty() -> Self {
+        let mut session = Self::demo();
+        session.fragments.clear();
+        session.pristine.clear();
+        session.file_name.clear();
+        session.map_pixels = 0;
+        session.genome_bp = 0;
+        session.map_revision = 0;
+        session
+    }
+
     pub fn demo() -> Self {
         let tags: Vec<String> = TAGS.iter().map(|s| (*s).to_string()).collect();
         let mut s = Self {
@@ -344,7 +359,8 @@ impl Session {
             redo: Vec::new(),
             camera: Camera::default(),
             gamma: [0.0, 0.5, 1.0],
-            colormap: 1,
+            signal: crate::yumi::SignalMethod::Pretext,
+            colormap: crate::colormap::FALL,
             colormap_order: (0..NAMES.len()).collect(),
             use_custom_colormap_order: false,
             mode: Mode::Normal,
@@ -1151,6 +1167,11 @@ impl Session {
         screen_per_texel > 3.0
     }
 
+    /// Suggested AGP download name: the map file without its `.pretext` suffix.
+    pub fn agp_file_name(&self) -> String {
+        agp_export_name(&self.file_name)
+    }
+
     pub fn to_agp(&self) -> String {
         let mut lines = vec!["##agp-version 2.1".to_string()];
         let mut objects: Vec<(String, Vec<usize>)> = Vec::new();
@@ -1242,6 +1263,7 @@ impl Session {
             edits: self.edits.clone(),
             camera: self.camera,
             gamma: self.gamma,
+            signal: self.signal,
             colormap: self.colormap,
             tags: self.tags.clone(),
             grey_tags: self.grey_tags.clone(),
@@ -1262,6 +1284,7 @@ impl Session {
         self.edits = state.edits;
         self.camera = state.camera;
         self.gamma = state.gamma;
+        self.signal = state.signal;
         self.colormap = state.colormap;
         if !state.tags.is_empty() {
             self.tags = state.tags;
@@ -1494,7 +1517,11 @@ impl Session {
     }
 
     fn color_of(&self, value: f32) -> [u8; 4] {
-        crate::colormap::sample(self.colormap, crate::colormap::tone(value.clamp(0.0, 1.0), self.gamma))
+        let curved = match self.signal {
+            crate::yumi::SignalMethod::Pretext => crate::colormap::tone(value, self.gamma),
+            crate::yumi::SignalMethod::Yumi => crate::yumi::tone(value, self.gamma),
+        };
+        crate::colormap::sample(self.colormap, curved)
     }
 
     fn prefix_sums(&self) -> Vec<u32> {
@@ -1589,6 +1616,7 @@ impl Session {
         self.use_custom_colormap_order = false;
         self.tracks = fresh.tracks;
         self.gamma = [0.0, 0.5, 1.0];
+        self.signal = crate::yumi::SignalMethod::Pretext;
         self.bump();
     }
 
@@ -1784,6 +1812,36 @@ fn concat_at_ends(a: &[Fragment], b: &[Fragment], u: u64, v: u64) -> Option<(Vec
     best
 }
 
+/// `sample.alg.pretext` becomes `sample.alg.agp`. A name the user typed is kept,
+/// with `.agp` added when they left the extension off.
+pub fn agp_export_name(map_name: &str) -> String {
+    let base = map_name.rsplit(['/', '\\']).next().unwrap_or(map_name).trim();
+    let stem = strip_pretext_suffix(base);
+    let stem = if stem.is_empty() { "map" } else { stem };
+    ensure_agp_suffix(stem)
+}
+
+pub fn ensure_agp_suffix(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return "map.agp".to_string();
+    }
+    if name.to_ascii_lowercase().ends_with(".agp") {
+        name.to_string()
+    } else {
+        format!("{name}.agp")
+    }
+}
+
+fn strip_pretext_suffix(name: &str) -> &str {
+    let lower = name.to_ascii_lowercase();
+    if let Some(stripped) = lower.strip_suffix(".pretext") {
+        name[..stripped.len()].trim_end_matches('.')
+    } else {
+        name
+    }
+}
+
 fn reverse_chain(chain: &mut [Fragment]) {
     chain.reverse();
     for frag in chain {
@@ -1865,6 +1923,27 @@ mod tests {
     }
 
     #[test]
+    fn invert_mirrors_contacts_along_a_contig() {
+        let mut session = Session::demo();
+        let index = 2;
+        let uid = session.fragments[index].uid;
+        let (side, before) = session.raster_rgba(session.map_pixels);
+        session.invert_uids(&[uid]).unwrap();
+        assert!(session.fragments.iter().any(|frag| frag.uid == uid && frag.inverted));
+        let (side_after, after) = session.raster_rgba(session.map_pixels);
+        assert_eq!(side, side_after);
+        let changed = before
+            .chunks(4)
+            .zip(after.chunks(4))
+            .filter(|(left, right)| left != right)
+            .count();
+        assert!(
+            changed > side as usize,
+            "inverting one contig should repaint a strip of the map, changed {changed} pixels"
+        );
+    }
+
+    #[test]
     fn place_moves_a_fragment_without_losing_pixels() {
         let mut session = Session::demo();
         let uid = session.fragments[0].uid;
@@ -1891,6 +1970,14 @@ mod tests {
         session.sort_fragments(None);
         let agp = session.to_agp();
         assert!(agp.contains("ptg000000l"));
+        assert_eq!(session.agp_file_name(), "demo.agp");
+        assert_eq!(
+            super::agp_export_name("idOchAnnu3_RC-5104_normal.alg.pretext"),
+            "idOchAnnu3_RC-5104_normal.alg.agp"
+        );
+        assert_eq!(super::agp_export_name(r"maps\Sample.PRETEXT"), "Sample.agp");
+        assert_eq!(super::ensure_agp_suffix("my_assembly"), "my_assembly.agp");
+        assert_eq!(super::ensure_agp_suffix("custom.agp"), "custom.agp");
         let mut shuffled = Session::demo();
         let n = shuffled.load_agp(&agp).unwrap();
         assert!(n > 0);

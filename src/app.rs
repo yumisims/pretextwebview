@@ -6,14 +6,16 @@ use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use web_time::{Duration, Instant};
 
 use crate::colormap::NAMES;
-use crate::model::{Mode, Session, SortMode, BACKGROUNDS};
+use crate::model::{ensure_agp_suffix, Mode, Session, SortMode, BACKGROUNDS};
 use crate::pretext::{MapLoader, Pump};
+use crate::yumi::SignalMethod;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct TexKey {
     revision: u64,
     colormap: usize,
     gamma: [u32; 3],
+    signal: u8,
 }
 
 struct Detail {
@@ -45,6 +47,7 @@ pub struct PretextApp {
     session: Session,
     status: String,
     show_panel: bool,
+    show_view: bool,
     selection: Vec<u64>,
     press: Option<Press>,
     grab_armed: bool,
@@ -60,6 +63,8 @@ pub struct PretextApp {
     detail: Option<Detail>,
     detail_at: Instant,
     seq_query: String,
+    /// Suggested AGP download name. Filled from the map, and editable.
+    agp_name: String,
     menu_theme: MenuTheme,
     events: mpsc::Receiver<Msg>,
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -71,10 +76,11 @@ impl PretextApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let (events_tx, events) = mpsc::channel();
-        let mut app = Self {
-            session: Session::demo(),
-            status: "Demo map. Load a .pretext file, or drop one on the view. Esc hides the panel.".to_string(),
+        let app = Self {
+            session: Session::empty(),
+            status: "Load a .pretext file, or drop one on the view. Esc hides the panel.".to_string(),
             show_panel: true,
+            show_view: true,
             selection: Vec::new(),
             press: None,
             grab_armed: false,
@@ -90,40 +96,13 @@ impl PretextApp {
             detail: None,
             detail_at: Instant::now(),
             seq_query: String::new(),
+            agp_name: Session::empty().agp_file_name(),
             menu_theme: MenuTheme::Dark,
             events,
             events_tx,
             dialog_open: false,
         };
-        #[cfg(not(target_arch = "wasm32"))]
-        app.open_demo_file();
-        #[cfg(target_arch = "wasm32")]
-        app.fetch_bundled(cc.egui_ctx.clone());
         app
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn open_demo_file(&mut self) {
-        for path in ["demo.pretext", "src/demo.pretext"] {
-            let Ok(bytes) = std::fs::read(path) else {
-                continue;
-            };
-            if bytes.len() >= 4 && &bytes[..4] == b"pstm" {
-                self.begin_pretext(path.to_string(), bytes);
-                return;
-            }
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn fetch_bundled(&mut self, ctx: egui::Context) {
-        let tx = self.events_tx.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Some((name, bytes)) = fetch_bundled_bytes().await {
-                let _ = tx.send(Msg::Pretext { name, bytes });
-                ctx.request_repaint();
-            }
-        });
     }
 
     fn poll(&mut self) {
@@ -188,6 +167,7 @@ impl PretextApp {
         };
         let preview = loader.preview();
         self.status = self.session.install_map(preview, name);
+        self.agp_name = self.session.agp_file_name();
         self.selection.clear();
         self.press = None;
         self.grab_armed = false;
@@ -269,12 +249,22 @@ impl PretextApp {
                 key(egui::Key::T),
                 key(egui::Key::N),
                 key(egui::Key::V),
+                key(egui::Key::Space),
+                key(egui::Key::H),
             )
         });
-        let (escape, undo, redo, invert, edit_key, extension, tel3, tel5, coverage, gap, repeat, tooltip_or_tel, names, cut) =
+        let (escape, undo, redo, invert, edit_key, extension, tel3, tel5, coverage, gap, repeat, tooltip_or_tel, names, cut, space, hide_view) =
             pressed;
         if escape {
             self.show_panel = !self.show_panel;
+        }
+        if hide_view {
+            self.show_view = !self.show_view;
+            self.status = if self.show_view {
+                "View on.".to_string()
+            } else {
+                "View off. H shows it again.".to_string()
+            };
         }
         if undo {
             self.session.undo_edit();
@@ -282,8 +272,8 @@ impl PretextApp {
         if redo {
             self.session.redo_edit();
         }
-        if invert {
-            self.invert_selection();
+        if invert || (space && self.session.mode == Mode::Edit) {
+            self.invert_current(true);
         }
         if edit_key {
             self.toggle_edit_mode();
@@ -344,7 +334,7 @@ impl PretextApp {
             other => other,
         };
         self.status = if self.session.mode == Mode::Edit {
-            "Edit mode. Drag a block to move it. V cuts the contig under the pointer. I inverts.".to_string()
+            "Edit mode. Drag a block to move it. V cuts the contig under the pointer. I or Space inverts it.".to_string()
         } else {
             "Left edit mode.".to_string()
         };
@@ -359,10 +349,61 @@ impl PretextApp {
         self.status = format!("{name} {state}");
     }
 
-    fn invert_selection(&mut self) {
-        match self.session.invert_uids(&self.selection) {
-            Ok(()) => self.status = "Inverted the selection.".to_string(),
+    /// `from_pointer` inverts the contig under the cursor. A selection is used
+    /// when the cursor is inside it, when a block is already picked up, or when
+    /// the Invert button is used with the pointer away from the map.
+    fn invert_current(&mut self, from_pointer: bool) {
+        let uids = self.invert_target(from_pointer);
+        if uids.is_empty() {
+            self.status = "Point at a contig, or select one, then invert.".to_string();
+            return;
+        }
+        let label = self.describe_uids(&uids);
+        self.selection = uids.clone();
+        match self.session.invert_uids(&uids) {
+            Ok(()) => self.status = format!("Inverted {label}."),
             Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    fn invert_target(&self, from_pointer: bool) -> Vec<u64> {
+        if self.grab_armed && !self.selection.is_empty() {
+            return self.selection.clone();
+        }
+        if from_pointer {
+            if let Some(pixel) = self.hover_pixel {
+                if let Some((start, end)) = self.selection_span() {
+                    if !self.selection.is_empty() && pixel >= start && pixel < end {
+                        return self.selection.clone();
+                    }
+                }
+                if let Some(index) = self.session.fragment_at(pixel) {
+                    return vec![self.session.fragments[index].uid];
+                }
+            }
+        }
+        if !self.selection.is_empty() {
+            return self.selection.clone();
+        }
+        self.hovered_uid().into_iter().collect()
+    }
+
+    fn hovered_uid(&self) -> Option<u64> {
+        let pixel = self.hover_pixel?;
+        let index = self.session.fragment_at(pixel)?;
+        Some(self.session.fragments[index].uid)
+    }
+
+    fn describe_uids(&self, uids: &[u64]) -> String {
+        if uids.len() == 1 {
+            self.session
+                .fragments
+                .iter()
+                .find(|frag| frag.uid == uids[0])
+                .map(|frag| frag.name.clone())
+                .unwrap_or_else(|| "1 contig".to_string())
+        } else {
+            format!("{} contigs", uids.len())
         }
     }
 
@@ -457,8 +498,44 @@ impl PretextApp {
 
         let (wide, narrow) = split_widths(ui, 2.0, 1.0);
         ui.horizontal(|ui| {
-            if menu_sized(ui, "Generate AGP", wide, row_h).clicked() {
-                self.save_text(ui.ctx().clone(), "map.agp", "agp", self.session.to_agp());
+            let generate = menu_sized(ui, "Generate AGP", wide, row_h);
+            let popup_id = ui.make_persistent_id("agp-name-popup");
+            if generate.clicked() {
+                if self.agp_name.trim().is_empty() {
+                    self.agp_name = self.session.agp_file_name();
+                }
+                ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+            }
+            let hint = self.session.agp_file_name();
+            let mut export = false;
+            egui::popup::popup_below_widget(
+                ui,
+                popup_id,
+                &generate,
+                egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+                |ui| {
+                    ui.set_min_width(generate.rect.width().max(220.0));
+                    ui.label("AGP name");
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.agp_name)
+                            .hint_text(hint)
+                            .desired_width(generate.rect.width().max(220.0)),
+                    );
+                    if generate.clicked() {
+                        edit.request_focus();
+                    }
+                    let save = ui.add_sized(Vec2::new(ui.available_width(), row_h), egui::Button::new("Save"));
+                    let enter = edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    if save.clicked() || enter {
+                        export = true;
+                        ui.memory_mut(|mem| mem.close_popup());
+                    }
+                },
+            );
+            if export {
+                let name = self.chosen_agp_name();
+                self.agp_name = name.clone();
+                self.save_text(ui.ctx().clone(), &name, "agp", self.session.to_agp());
             }
             if menu_sized(ui, "User Profile", narrow, row_h).clicked() {
                 self.session.reset_profile();
@@ -511,7 +588,7 @@ impl PretextApp {
                         let entering_edit = *mode == Mode::Edit && self.session.mode != Mode::Edit;
                         self.session.mode = if self.session.mode == *mode { Mode::Normal } else { *mode };
                         if entering_edit {
-                            self.status = "Edit mode. Drag a block to move it. V cuts the contig under the pointer. I inverts.".to_string();
+                            self.status = "Edit mode. Drag a block to move it. V cuts the contig under the pointer. I or Space inverts it.".to_string();
                         }
                     }
                 }
@@ -534,6 +611,19 @@ impl PretextApp {
             menu_check(&mut cols[0], &mut self.session.tooltip_on, "Tool Tip");
             menu_check(&mut cols[1], &mut self.session.invert_mouse, "Invert Mouse Buttons");
         });
+        menu_check(ui, &mut self.show_view, "View");
+
+        ui.columns(2, |cols| {
+            if menu_choice(&mut cols[0], "Ed", self.session.signal == SignalMethod::Pretext, row_h).clicked() {
+                self.session.signal = SignalMethod::Pretext;
+                self.status = "Ed gamma.".to_string();
+            }
+            if menu_choice(&mut cols[1], "Yumi", self.session.signal == SignalMethod::Yumi, row_h).clicked() {
+                self.session.signal = SignalMethod::Yumi;
+                self.status = "Yumi log scale. Weak contacts use more of the colour range.".to_string();
+            }
+        });
+        ui.label("Yumi logs the bytes between Min and Max. Mid is only used by Ed.");
 
         let mut gamma_changed = false;
         gamma_changed |= gamma_slider(ui, "Gamma Min", &mut self.session.gamma[0]);
@@ -599,7 +689,7 @@ impl PretextApp {
             });
             ui.columns(3, |cols| {
                 if menu_button(&mut cols[0], "Invert", row_h).clicked() {
-                    self.invert_selection();
+                    self.invert_current(false);
                 }
                 if menu_button(&mut cols[1], "Split", row_h).clicked() {
                     if let Some(pixel) = self.hover_pixel {
@@ -835,6 +925,15 @@ impl PretextApp {
         }
     }
 
+    fn chosen_agp_name(&self) -> String {
+        let typed = self.agp_name.trim();
+        if typed.is_empty() {
+            self.session.agp_file_name()
+        } else {
+            ensure_agp_suffix(typed)
+        }
+    }
+
     fn save_text(&mut self, ctx: egui::Context, file_name: &str, ext: &str, text: String) {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -954,7 +1053,7 @@ impl PretextApp {
         } else {
             (egui::PointerButton::Primary, egui::PointerButton::Secondary)
         };
-        let (hover, scroll, delta, edit_down, edit_pressed, edit_released, pan_down, pan_pressed, shift) = ui.input(|input| {
+        let (hover, scroll, delta, edit_down, edit_pressed, edit_released, pan_down, pan_pressed, middle_pressed, shift) = ui.input(|input| {
             (
                 input.pointer.hover_pos(),
                 input.smooth_scroll_delta.y,
@@ -964,6 +1063,7 @@ impl PretextApp {
                 input.pointer.button_released(edit_button),
                 input.pointer.button_down(pan_button),
                 input.pointer.button_pressed(pan_button),
+                input.pointer.button_pressed(egui::PointerButton::Middle),
                 input.modifiers.shift,
             )
         });
@@ -988,6 +1088,10 @@ impl PretextApp {
         } else {
             self.hover_world = None;
             self.hover_pixel = None;
+        }
+
+        if middle_pressed && self.session.mode == Mode::Edit && self.hover_pixel.is_some() {
+            self.invert_current(true);
         }
 
         if pan_pressed && hover.is_some_and(|pos| view.rect.contains(pos)) {
@@ -1519,6 +1623,134 @@ impl eframe::App for PretextApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| self.map_view(ui));
+        paint_mode_help(ctx, self.session.mode, &mut self.show_view);
+    }
+}
+
+fn paint_mode_help(ctx: &egui::Context, mode: Mode, open: &mut bool) {
+    if !*open {
+        return;
+    }
+    let (title, lines) = mode_help(mode);
+    let ink = Color32::from_rgb(255, 255, 255);
+    let paper = Color32::from_rgb(12, 14, 18);
+    let mut visuals = ctx.style().visuals.clone();
+    visuals.override_text_color = Some(ink);
+    visuals.window_fill = paper;
+    ctx.set_visuals(visuals);
+
+    let corner = ctx.available_rect().right_bottom() + Vec2::new(-16.0, -16.0);
+    egui::Window::new(egui::RichText::new(title).strong().size(18.0).color(ink))
+        .id(egui::Id::new("mode-help"))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::RIGHT_BOTTOM)
+        .default_pos(corner)
+        .open(open)
+        .movable(true)
+        .collapsible(false)
+        .resizable(false)
+        .fade_in(false)
+        .frame(
+            egui::Frame::new()
+                .fill(paper)
+                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(230, 230, 230)))
+                .inner_margin(egui::Margin::same(12))
+                .corner_radius(6),
+        )
+        .show(ctx, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.style_mut().spacing.item_spacing.y = 4.0;
+            ui.set_min_width(240.0);
+            ui.set_max_width(360.0);
+            for line in lines {
+                ui.label(egui::RichText::new(*line).size(16.0).color(ink));
+            }
+        });
+}
+
+fn mode_help(mode: Mode) -> (&'static str, &'static [&'static str]) {
+    match mode {
+        Mode::Normal => (
+            "View",
+            &[
+                "E: Edit mode",
+                "I: invert the contig under the pointer",
+                "X: Extension mode",
+                "T: tooltip",
+                "N: contig name labels",
+                "3 / 5: telomere tracks",
+                "Scroll: zoom    right drag: pan",
+                "Click: focus a contig",
+                "H: hide this view",
+                "Esc: menu",
+            ],
+        ),
+        Mode::Edit => (
+            "Edit Mode",
+            &[
+                "E: exit",
+                "Left drag: move a block",
+                "Click, then click outside: place",
+                "V: cut the contig under the pointer",
+                "I or Space: invert the contig under the pointer",
+                "Middle click: invert that contig",
+                "Cmd-Z: undo    Cmd-Shift-Z: redo",
+                "N: contig name labels",
+                "Esc: menu",
+            ],
+        ),
+        Mode::Waypoint => (
+            "Waypoint Edit Mode",
+            &[
+                "Click: add a waypoint",
+                "N: contig name labels",
+                "T: tooltip",
+                "Scroll: zoom    right drag: pan",
+                "Esc: menu",
+            ],
+        ),
+        Mode::Scaffold => (
+            "Scaffold Edit Mode",
+            &[
+                "Click: paint the current scaffold",
+                "Drag: paint a range",
+                "N: contig name labels",
+                "Esc: menu",
+            ],
+        ),
+        Mode::Meta => (
+            "MetaData Tag Mode",
+            &[
+                "Click: toggle the active tag",
+                "E: Edit mode",
+                "N: contig name labels",
+                "Esc: menu",
+            ],
+        ),
+        Mode::Extension => (
+            "Extension Mode",
+            &[
+                "X: exit",
+                "C: coverage",
+                "G: gap",
+                "R: repeat density",
+                "T: telomere",
+                "3 / 5: 3p / 5p telomere",
+                "N: contig name labels",
+                "Esc: menu",
+            ],
+        ),
+        Mode::SelectSort => (
+            "Select sort area",
+            &[
+                "Click: mark a contig",
+                "Shift-click: add or remove",
+                "Pixel Sort uses the marked contigs",
+                "E: Edit mode",
+                "N: contig name labels",
+                "Esc: menu",
+            ],
+        ),
     }
 }
 
@@ -1732,6 +1964,10 @@ fn tex_key(session: &Session) -> TexKey {
         revision: session.map_revision,
         colormap: session.colormap,
         gamma: session.gamma.map(|value| (value * 1000.0).round() as u32),
+        signal: match session.signal {
+            SignalMethod::Pretext => 0,
+            SignalMethod::Yumi => 1,
+        },
     }
 }
 
@@ -1825,23 +2061,4 @@ fn format_bp(bp: f32) -> String {
     } else {
         format!("{bp:.0} bp")
     }
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn fetch_bundled_bytes() -> Option<(String, Vec<u8>)> {
-    use eframe::wasm_bindgen::JsCast;
-
-    let window = eframe::web_sys::window()?;
-    let url = "idOchAnnu3_RC-5104_normal.alg.pretext";
-    let value = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await.ok()?;
-    let response: eframe::web_sys::Response = value.dyn_into().ok()?;
-    if !response.ok() {
-        return None;
-    }
-    let buffer = wasm_bindgen_futures::JsFuture::from(response.array_buffer().ok()?).await.ok()?;
-    let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
-    if bytes.len() < 4 || &bytes[..4] != b"pstm" {
-        return None;
-    }
-    Some((url.to_string(), bytes))
 }

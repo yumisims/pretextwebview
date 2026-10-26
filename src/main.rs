@@ -2,6 +2,7 @@ mod app;
 mod colormap;
 mod model;
 mod pretext;
+mod yumi;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {

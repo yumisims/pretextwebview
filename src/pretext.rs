@@ -141,12 +141,22 @@ impl ContactMap {
     }
 }
 
+/// One graph extension embedded in a `.pretext` file. PretextGraph writes
+/// coverage, gap, repeat, telomere, bedgraph, bigWig, and alg tracks this way.
+#[derive(Clone, Debug)]
+pub struct LoadedGraph {
+    pub name: String,
+    /// One sample per original map pixel, scaled to 0..=1.
+    pub values: Vec<f32>,
+}
+
 pub struct LoadedMap {
     pub genome_bp: u64,
     pub map_pixels: u32,
     pub contigs: Vec<DecodedContig>,
     pub contacts: ContactMap,
     pub tracks_on: Vec<TrackKind>,
+    pub graphs: Vec<LoadedGraph>,
     pub omitted: usize,
     pub failed_tiles: usize,
 }
@@ -322,6 +332,7 @@ impl MapLoader {
             contigs,
             contacts: self.contacts_shell(),
             tracks_on: Vec::new(),
+            graphs: Vec::new(),
             omitted,
             failed_tiles: 0,
         }
@@ -438,7 +449,15 @@ impl MapLoader {
             return Err("the pretext header listed no sequences that cover the map".to_string());
         }
         let mut tracks_on = Vec::new();
-        if let Err(err) = apply_extensions(&self.bytes, self.extension_at, self.map_pixels, &mut contigs, &mut tracks_on) {
+        let mut graphs = Vec::new();
+        if let Err(err) = apply_extensions(
+            &self.bytes,
+            self.extension_at,
+            self.map_pixels,
+            &mut contigs,
+            &mut tracks_on,
+            &mut graphs,
+        ) {
             // The contact map is already decoded. A bad graph block should not hide it.
             let _ = err;
         }
@@ -464,6 +483,7 @@ impl MapLoader {
             contigs,
             contacts,
             tracks_on,
+            graphs,
             omitted,
             failed_tiles: self.failed_tiles,
         })
@@ -476,9 +496,11 @@ fn apply_extensions(
     map_pixels: u32,
     contigs: &mut [DecodedContig],
     tracks_on: &mut Vec<TrackKind>,
+    graphs: &mut Vec<LoadedGraph>,
 ) -> Result<(), String> {
+    let pixels = map_pixels.max(1) as usize;
     let mut guard = 0;
-    while offset + 8 <= bytes.len() && guard < 64 {
+    while offset + 8 <= bytes.len() && guard < 256 {
         guard += 1;
         if &bytes[offset..offset + 4] != b"psgh" {
             if let Some(found) = bytes[offset..].windows(4).position(|w| w == b"psgh") {
@@ -495,46 +517,48 @@ fn apply_extensions(
         }
         let inflated = inflate_raw(&bytes[offset..offset + len])?;
         offset += len;
-        let values_bytes = 4usize * map_pixels as usize;
-        if inflated.len() < 64 + values_bytes {
+        if inflated.len() < 68 {
             continue;
         }
-        let name = c_string(&inflated[..64], "graph");
-        let Some(kind) = kind_for(&name) else {
-            continue;
-        };
-        let mut values = vec![0f32; map_pixels as usize];
+        let name = c_string(&inflated[..64.min(inflated.len())], "graph");
+        let available = inflated.len().saturating_sub(64) / 4;
+        let count = available.min(pixels);
+        let mut raw = vec![0f32; pixels];
         let mut max = 1i32;
-        for (i, chunk) in inflated[64..64 + values_bytes].chunks_exact(4).enumerate() {
+        for (i, chunk) in inflated[64..64 + count * 4].chunks_exact(4).enumerate() {
             let v = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             if v > max {
                 max = v;
             }
-            values[i] = v.max(0) as f32;
+            raw[i] = v.max(0) as f32;
         }
         let max = max as f32;
-        for contig in contigs.iter_mut() {
-            let start = contig.ref_lo as usize;
-            let end = (contig.ref_lo + contig.pixels) as usize;
-            let slice = &values[start.min(values.len())..end.min(values.len())];
-            let mean = if slice.is_empty() {
-                0.0
-            } else {
-                slice.iter().sum::<f32>() / slice.len() as f32 / max
-            };
-            match kind {
-                TrackKind::Coverage => contig.coverage = mean,
-                TrackKind::Gap => contig.gap = mean,
-                TrackKind::Repeat => contig.repeat = mean,
-                TrackKind::Telomere => contig.telomere = mean,
-                TrackKind::Telomere3 => contig.telomere_3 = mean,
-                TrackKind::Telomere5 => contig.telomere_5 = mean,
-                TrackKind::PixelDensity => contig.pixel_density = mean,
+        let values: Vec<f32> = raw.iter().map(|v| *v / max).collect();
+        if let Some(kind) = kind_for(&name) {
+            for contig in contigs.iter_mut() {
+                let start = contig.ref_lo as usize;
+                let end = (contig.ref_lo + contig.pixels) as usize;
+                let slice = &values[start.min(values.len())..end.min(values.len())];
+                let mean = if slice.is_empty() {
+                    0.0
+                } else {
+                    slice.iter().sum::<f32>() / slice.len() as f32
+                };
+                match kind {
+                    TrackKind::Coverage => contig.coverage = mean,
+                    TrackKind::Gap => contig.gap = mean,
+                    TrackKind::Repeat => contig.repeat = mean,
+                    TrackKind::Telomere => contig.telomere = mean,
+                    TrackKind::Telomere3 => contig.telomere_3 = mean,
+                    TrackKind::Telomere5 => contig.telomere_5 = mean,
+                    TrackKind::PixelDensity => contig.pixel_density = mean,
+                }
+            }
+            if !tracks_on.contains(&kind) {
+                tracks_on.push(kind);
             }
         }
-        if !tracks_on.contains(&kind) {
-            tracks_on.push(kind);
-        }
+        graphs.push(LoadedGraph { name, values });
     }
     Ok(())
 }
@@ -878,5 +902,36 @@ mod tests {
         assert_eq!(at(0, 1), 180);
         assert_eq!(at(0, 0), 10);
         assert_eq!(at(1, 0), 10);
+    }
+
+    fn graph_block(name: &str, values: &[i32]) -> Vec<u8> {
+        let mut raw = vec![0u8; 64 + values.len() * 4];
+        let bytes = name.as_bytes();
+        raw[..bytes.len().min(63)].copy_from_slice(&bytes[..bytes.len().min(63)]);
+        for (i, value) in values.iter().enumerate() {
+            raw[64 + i * 4..64 + i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let compressed = deflate_raw(&raw);
+        let mut out = b"psgh".to_vec();
+        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&compressed);
+        out
+    }
+
+    #[test]
+    fn every_named_graph_is_kept() {
+        let mut file = pack(&header(&[("chr1", 1.0)], 1_000, 2, 0, 1), &[bc4_solid(40).to_vec()]);
+        file.extend(graph_block("coverage", &[0, 10, 20, 40]));
+        file.extend(graph_block("sample.bedgraph", &[0, 0, 8, 4]));
+        file.extend(graph_block("alg", &[1, 1, 1, 2]));
+        let loaded = load(file);
+        assert_eq!(
+            loaded.graphs.iter().map(|graph| graph.name.as_str()).collect::<Vec<_>>(),
+            vec!["coverage", "sample.bedgraph", "alg"]
+        );
+        assert!((loaded.graphs[0].values[3] - 1.0).abs() < 1e-5);
+        assert!((loaded.graphs[1].values[2] - 1.0).abs() < 1e-5);
+        assert!(loaded.tracks_on.contains(&TrackKind::Coverage));
+        assert!(loaded.contigs[0].coverage > 0.0);
     }
 }
