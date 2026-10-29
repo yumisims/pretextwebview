@@ -328,6 +328,13 @@ pub struct Session {
     next_uid: u64,
 }
 
+fn bin_center(bin: u32, side: u32, map: u32) -> u32 {
+    let start = (bin as u64 * map as u64) / side.max(1) as u64;
+    let end = ((bin as u64 + 1) * map as u64) / side.max(1) as u64;
+    let end = end.max(start + 1);
+    ((start + end - 1) / 2).min(map.saturating_sub(1) as u64) as u32
+}
+
 fn overview_index(mapped: u32, side: u32, full: u32) -> usize {
     if side == full {
         return mapped as usize;
@@ -1382,7 +1389,7 @@ impl Session {
         if loaded.failed_tiles > 0 {
             message.push_str(&format!(", {} tiles could not be decoded", loaded.failed_tiles));
         }
-        message.push_str(". Drag a block to pick it up, then click outside it to move it.");
+        message.push_str(". Scroll to zoom; drag with the pan button to move the view.");
         message
     }
 
@@ -1415,8 +1422,64 @@ impl Session {
         if failed > 0 {
             message.push_str(&format!(", {failed} tiles could not be decoded"));
         }
-        message.push_str(". Drag a block to pick it up, then click outside it to move it.");
+        message.push_str(". Scroll to zoom; drag with the pan button to move the view.");
         message
+    }
+
+    /// Display-order contact grid used by the suggestion scan. Real maps use the
+    /// overview texture. The synthetic demo uses the same reference-distance curve
+    /// as [`contact_at`].
+    pub(crate) fn contact_grid(&self) -> crate::suggest::ContactGrid {
+        use crate::suggest::ContactGrid;
+        let side = if let Some(contacts) = &self.contacts {
+            let overview = contacts.overview_side;
+            if overview == 0 || self.map_pixels == 0 || self.fragments.is_empty() {
+                0
+            } else {
+                overview.min(384)
+            }
+        } else if self.map_pixels == 0 || self.fragments.is_empty() {
+            0
+        } else {
+            self.map_pixels.min(384)
+        };
+        if side == 0 {
+            return ContactGrid {
+                side: 0,
+                values: Vec::new(),
+                owner: Vec::new(),
+                pixel: Vec::new(),
+            };
+        }
+        let prefix = self.prefix_sums();
+        let map = self.map_pixels.max(1);
+        let mut orig = vec![0u32; side as usize];
+        let mut owner = vec![0usize; side as usize];
+        let mut pixel = vec![0u32; side as usize];
+        for bin in 0..side {
+            let display = bin_center(bin, side, map);
+            let (original, index) = self.original_pixel(display as i32, &prefix);
+            orig[bin as usize] = original;
+            owner[bin as usize] = index;
+            pixel[bin as usize] = display;
+        }
+        let index = if self.contacts.is_none() {
+            self.pix_index()
+        } else {
+            Vec::new()
+        };
+        let mut values = vec![0.0f32; (side as usize) * (side as usize)];
+        for y in 0..side {
+            for x in 0..side {
+                let value = if let Some(contacts) = &self.contacts {
+                    contacts.overview_at(orig[x as usize], orig[y as usize]) as f32 / 255.0
+                } else {
+                    contact_at(self, pixel[x as usize], pixel[y as usize], &index)
+                };
+                values[(y * side + x) as usize] = value;
+            }
+        }
+        ContactGrid { side, values, owner, pixel }
     }
 
     /// RGBA image of the whole map. `max_side` caps the contact overview so a

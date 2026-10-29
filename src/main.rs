@@ -2,6 +2,7 @@ mod app;
 mod colormap;
 mod model;
 mod pretext;
+mod suggest;
 mod yumi;
 
 #[cfg(not(target_arch = "wasm32"))]

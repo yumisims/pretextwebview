@@ -6,8 +6,9 @@ use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use web_time::{Duration, Instant};
 
 use crate::colormap::NAMES;
-use crate::model::{ensure_agp_suffix, Mode, Session, SortMode, BACKGROUNDS};
+use crate::model::{ensure_agp_suffix, Mode, Session, BACKGROUNDS};
 use crate::pretext::{MapLoader, Pump};
+use crate::suggest::{self, SuggestId, Suggestion};
 use crate::yumi::SignalMethod;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,7 +66,12 @@ pub struct PretextApp {
     seq_query: String,
     /// Suggested AGP download name. Filled from the map, and editable.
     agp_name: String,
+    map_url: String,
     menu_theme: MenuTheme,
+    suggestions: Vec<Suggestion>,
+    suggestion_skips: Vec<SuggestId>,
+    suggestions_ready: bool,
+    scanned_stamp: u64,
     events: mpsc::Receiver<Msg>,
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     events_tx: mpsc::Sender<Msg>,
@@ -75,12 +81,16 @@ pub struct PretextApp {
 impl PretextApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        Self::initial_state()
+    }
+
+    fn initial_state() -> Self {
         let (events_tx, events) = mpsc::channel();
         let app = Self {
             session: Session::empty(),
-            status: "Load a .pretext file, or drop one on the view. Esc hides the panel.".to_string(),
+            status: "Load a .pretext file or an https link, or drop a file on the view. Esc hides the panel.".to_string(),
             show_panel: true,
-            show_view: true,
+            show_view: false,
             selection: Vec::new(),
             press: None,
             grab_armed: false,
@@ -97,7 +107,12 @@ impl PretextApp {
             detail_at: Instant::now(),
             seq_query: String::new(),
             agp_name: Session::empty().agp_file_name(),
+            map_url: String::new(),
             menu_theme: MenuTheme::Dark,
+            suggestions: Vec::new(),
+            suggestion_skips: Vec::new(),
+            suggestions_ready: false,
+            scanned_stamp: 0,
             events,
             events_tx,
             dialog_open: false,
@@ -148,12 +163,10 @@ impl PretextApp {
 
     fn ingest(&mut self, name: &str, bytes: Vec<u8>) {
         let lower = name.to_ascii_lowercase();
-        if lower.ends_with(".json") {
-            self.load_json_text(&String::from_utf8_lossy(&bytes));
-        } else if lower.ends_with(".agp") {
-            self.load_agp_text(&String::from_utf8_lossy(&bytes));
-        } else {
+        if lower.ends_with(".pretext") {
             self.begin_pretext(name.to_string(), bytes);
+        } else {
+            self.status = "Only .pretext map files are supported in this viewer.".to_string();
         }
     }
 
@@ -167,6 +180,7 @@ impl PretextApp {
         };
         let preview = loader.preview();
         self.status = self.session.install_map(preview, name);
+        self.session.mode = Mode::Normal;
         self.agp_name = self.session.agp_file_name();
         self.selection.clear();
         self.press = None;
@@ -176,6 +190,7 @@ impl PretextApp {
         self.overview_key = None;
         self.saw_tile_preview = false;
         self.loader = Some(loader);
+        self.clear_suggestions();
     }
 
     fn pump_loader(&mut self, ctx: &egui::Context) {
@@ -214,6 +229,7 @@ impl PretextApp {
                 self.selection.clear();
                 self.detail = None;
                 self.overview_key = None;
+                self.clear_suggestions();
                 self.status = "Loaded JSON state.".to_string();
             }
             Err(err) => self.status = err,
@@ -222,96 +238,31 @@ impl PretextApp {
 
     fn load_agp_text(&mut self, text: &str) {
         match self.session.load_agp(text) {
-            Ok(n) => self.status = format!("AGP placed {n} parts."),
+            Ok(n) => {
+                self.clear_suggestions();
+                self.status = format!("AGP placed {n} parts.");
+            }
             Err(err) => self.status = err,
         }
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.show_panel = !self.show_panel;
+        }
         if ctx.wants_keyboard_input() {
             return;
         }
-        let pressed = ctx.input(|input| {
+        let (tooltip, names) = ctx.input(|input| {
             let plain = !input.modifiers.command && !input.modifiers.alt;
             let key = |key| plain && input.key_pressed(key);
-            (
-                input.key_pressed(egui::Key::Escape),
-                input.modifiers.command && input.key_pressed(egui::Key::Z) && !input.modifiers.shift,
-                input.modifiers.command && input.key_pressed(egui::Key::Z) && input.modifiers.shift,
-                key(egui::Key::I),
-                key(egui::Key::E),
-                key(egui::Key::X),
-                key(egui::Key::Num3),
-                key(egui::Key::Num5),
-                key(egui::Key::C),
-                key(egui::Key::G),
-                key(egui::Key::R),
-                key(egui::Key::T),
-                key(egui::Key::N),
-                key(egui::Key::V),
-                key(egui::Key::Space),
-                key(egui::Key::H),
-            )
+            (key(egui::Key::T), key(egui::Key::N))
         });
-        let (escape, undo, redo, invert, edit_key, extension, tel3, tel5, coverage, gap, repeat, tooltip_or_tel, names, cut, space, hide_view) =
-            pressed;
-        if escape {
-            self.show_panel = !self.show_panel;
-        }
-        if hide_view {
-            self.show_view = !self.show_view;
-            self.status = if self.show_view {
-                "View on.".to_string()
-            } else {
-                "View off. H shows it again.".to_string()
-            };
-        }
-        if undo {
-            self.session.undo_edit();
-        }
-        if redo {
-            self.session.redo_edit();
-        }
-        if invert || (space && self.session.mode == Mode::Edit) {
-            self.invert_current(true);
-        }
-        if edit_key {
-            self.toggle_edit_mode();
-        }
-        if extension && (self.session.mode == Mode::Normal || self.session.mode == Mode::Extension) {
-            self.session.mode = if self.session.mode == Mode::Extension {
-                Mode::Normal
-            } else {
-                Mode::Extension
-            };
-        }
-        if tel3 {
-            self.toggle_track("3p_telomere");
-        }
-        if tel5 {
-            self.toggle_track("5p_telomere");
-        }
-        if self.session.mode == Mode::Extension {
-            if coverage {
-                self.toggle_track("coverage");
-            }
-            if gap {
-                self.toggle_track("gap");
-            }
-            if repeat {
-                self.toggle_track("repeat_density");
-            }
-            if tooltip_or_tel {
-                self.toggle_track("telomere");
-            }
-        } else if tooltip_or_tel {
+        if tooltip {
             self.session.tooltip_on = !self.session.tooltip_on;
         }
         if names {
             self.session.labels_on = !self.session.labels_on;
-        }
-        if cut && self.session.mode == Mode::Edit {
-            self.cut_at_hover();
         }
     }
 
@@ -451,6 +402,103 @@ impl PretextApp {
         Some((start, start + self.session.fragments[index].pixels))
     }
 
+    fn clear_suggestions(&mut self) {
+        self.suggestions.clear();
+        self.suggestion_skips.clear();
+        self.suggestions_ready = false;
+        self.scanned_stamp = 0;
+    }
+
+    fn scan_suggestions(&mut self, fresh: bool) {
+        if self.session.fragments.is_empty() {
+            self.suggestions.clear();
+            self.suggestions_ready = true;
+            self.scanned_stamp = suggest::layout_stamp(&self.session);
+            self.status = "Load a map, then scan.".to_string();
+            return;
+        }
+        if fresh {
+            self.suggestion_skips.clear();
+        }
+        self.suggestions = suggest::suggest(&self.session, &self.suggestion_skips);
+        self.suggestions_ready = true;
+        self.scanned_stamp = suggest::layout_stamp(&self.session);
+        let n = self.suggestions.len();
+        self.status = if n == 0 {
+            "No edits suggested.".to_string()
+        } else {
+            format!("{n} suggestions. Show jumps there. Accept applies one step.")
+        };
+    }
+
+    fn suggestions_ui(&mut self, ui: &mut egui::Ui) {
+        let row_h = 30.0;
+        if menu_button(ui, "Scan", row_h).clicked() {
+            self.scan_suggestions(true);
+        }
+        if self.session.fragments.is_empty() {
+            ui.label("Load a map, then scan.");
+            return;
+        }
+        if !self.suggestions_ready {
+            ui.label("Scan proposes splits, inversions, and moves.");
+            return;
+        }
+        let stale = suggest::layout_stamp(&self.session) != self.scanned_stamp;
+        if stale {
+            ui.label("The map changed. Scan again before accepting.");
+        }
+        if self.suggestions.is_empty() {
+            ui.label("No edits suggested.");
+            return;
+        }
+        let mut action: Option<(usize, SuggestAct)> = None;
+        for (index, suggestion) in self.suggestions.iter().enumerate() {
+            ui.label(suggestion.reason.as_str());
+            ui.columns(3, |cols| {
+                if menu_button(&mut cols[0], "Show", row_h).clicked() {
+                    action = Some((index, SuggestAct::Show));
+                }
+                if menu_button(&mut cols[1], "Accept", row_h).clicked() && !stale {
+                    action = Some((index, SuggestAct::Accept));
+                }
+                if menu_button(&mut cols[2], "Skip", row_h).clicked() {
+                    action = Some((index, SuggestAct::Skip));
+                }
+            });
+        }
+        let Some((index, act)) = action else {
+            return;
+        };
+        let Some(suggestion) = self.suggestions.get(index).cloned() else {
+            return;
+        };
+        match act {
+            SuggestAct::Show => {
+                suggest::focus(&mut self.session, &suggestion);
+                self.status = suggestion.reason;
+            }
+            SuggestAct::Accept => {
+                if suggest::layout_stamp(&self.session) != self.scanned_stamp {
+                    self.status = "The map changed. Scan again before accepting.".to_string();
+                    return;
+                }
+                match suggest::apply(&mut self.session, &suggestion) {
+                    Ok(()) => {
+                        self.status = format!("Applied. {}", suggestion.reason);
+                        self.scan_suggestions(false);
+                    }
+                    Err(err) => self.status = err,
+                }
+            }
+            SuggestAct::Skip => {
+                self.suggestion_skips.push(suggestion.id);
+                self.suggestions.remove(index);
+                self.status = "Skipped that suggestion.".to_string();
+            }
+        }
+    }
+
     fn options(&mut self, ui: &mut egui::Ui) {
         let row_h = 30.0;
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
@@ -483,116 +531,48 @@ impl PretextApp {
             }
         });
 
-        ui.columns(3, |cols| {
-            let load = egui::Button::new("Load Map").min_size(Vec2::new(cols[0].available_width(), row_h));
-            if cols[0].add_enabled(!self.dialog_open, load).clicked() {
-                self.pick_pretext(cols[0].ctx().clone());
-            }
-            if menu_button(&mut cols[1], "Save State", row_h).clicked() {
-                self.save_text(cols[1].ctx().clone(), "state.json", "json", self.session.save_json());
-            }
-            if menu_button(&mut cols[2], "Load State", row_h).clicked() {
-                self.pick_text(cols[2].ctx().clone(), "JSON", "json", Kind::Json);
-            }
-        });
-
-        let (wide, narrow) = split_widths(ui, 2.0, 1.0);
-        ui.horizontal(|ui| {
-            let generate = menu_sized(ui, "Generate AGP", wide, row_h);
-            let popup_id = ui.make_persistent_id("agp-name-popup");
-            if generate.clicked() {
-                if self.agp_name.trim().is_empty() {
-                    self.agp_name = self.session.agp_file_name();
-                }
+        {
+            let load = egui::Button::new("Load Map").min_size(Vec2::new(ui.available_width(), row_h));
+            let load_response = ui.add_enabled(!self.dialog_open, load);
+            let popup_id = ui.make_persistent_id("load-map-popup");
+            if load_response.clicked() {
                 ui.memory_mut(|mem| mem.toggle_popup(popup_id));
             }
-            let hint = self.session.agp_file_name();
-            let mut export = false;
             egui::popup::popup_below_widget(
                 ui,
                 popup_id,
-                &generate,
+                &load_response,
                 egui::popup::PopupCloseBehavior::CloseOnClickOutside,
                 |ui| {
-                    ui.set_min_width(generate.rect.width().max(220.0));
-                    ui.label("AGP name");
+                    ui.set_min_width(320.0);
+                    ui.label("Map link");
                     let edit = ui.add(
-                        egui::TextEdit::singleline(&mut self.agp_name)
-                            .hint_text(hint)
-                            .desired_width(generate.rect.width().max(220.0)),
+                        egui::TextEdit::singleline(&mut self.map_url)
+                            .hint_text("https://…")
+                            .desired_width(320.0),
                     );
-                    if generate.clicked() {
+                    if load_response.clicked() {
                         edit.request_focus();
                     }
-                    let save = ui.add_sized(Vec2::new(ui.available_width(), row_h), egui::Button::new("Save"));
+                    let open = ui.add_sized(Vec2::new(ui.available_width(), row_h), egui::Button::new("Open link"));
                     let enter = edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                    if save.clicked() || enter {
-                        export = true;
+                    if open.clicked() || enter {
+                        let url = self.map_url.clone();
+                        self.fetch_map_url(ui.ctx().clone(), &url);
+                        ui.memory_mut(|mem| mem.close_popup());
+                    }
+                    if ui
+                        .add_sized(
+                            Vec2::new(ui.available_width(), row_h),
+                            egui::Button::new("Choose .pretext file"),
+                        )
+                        .clicked()
+                    {
+                        self.pick_pretext(ui.ctx().clone());
                         ui.memory_mut(|mem| mem.close_popup());
                     }
                 },
             );
-            if export {
-                let name = self.chosen_agp_name();
-                self.agp_name = name.clone();
-                self.save_text(ui.ctx().clone(), &name, "agp", self.session.to_agp());
-            }
-            if menu_sized(ui, "User Profile", narrow, row_h).clicked() {
-                self.session.reset_profile();
-                self.status = "Restored the default profile.".to_string();
-            }
-        });
-
-        ui.columns(3, |cols| {
-            if menu_button(&mut cols[0], "About", row_h).clicked() {
-                self.status = "pretextwebview".to_string();
-            }
-            if menu_button(&mut cols[1], "Clipboard Editor", row_h).clicked() {
-                cols[1].ctx().copy_text(self.session.edits_text());
-                self.status = "Copied the edit list.".to_string();
-            }
-            if menu_button(&mut cols[2], "Clear Cache", row_h).clicked() {
-                self.detail = None;
-                self.overview_key = None;
-                self.status = "Cleared the image cache.".to_string();
-            }
-        });
-
-        ui.columns(2, |cols| {
-            if self.purple_button(&mut cols[0], "Pixel Cut").clicked() {
-                let only = if self.selection.is_empty() {
-                    None
-                } else {
-                    Some(self.selection.as_slice())
-                };
-                let n = self.session.pixel_cut(only);
-                self.status = format!("Pixel cut made {n} cuts.");
-            }
-            if self.purple_button(&mut cols[1], "Pixel Sort").clicked() {
-                self.pixel_sort();
-            }
-        });
-
-        let modes = [
-            (Mode::Waypoint, "Waypoint Edit Mode"),
-            (Mode::Scaffold, "Scaffold Edit Mode"),
-            (Mode::Edit, "Edit Mode"),
-            (Mode::SelectSort, "Select sort area"),
-            (Mode::Meta, "MetaData Tag Mode"),
-            (Mode::Extension, "Extension Mode"),
-        ];
-        for pair in modes.chunks(2) {
-            ui.columns(2, |cols| {
-                for (col, (mode, label)) in cols.iter_mut().zip(pair) {
-                    if menu_choice(col, label, self.session.mode == *mode, row_h).clicked() {
-                        let entering_edit = *mode == Mode::Edit && self.session.mode != Mode::Edit;
-                        self.session.mode = if self.session.mode == *mode { Mode::Normal } else { *mode };
-                        if entering_edit {
-                            self.status = "Edit mode. Drag a block to move it. V cuts the contig under the pointer. I or Space inverts it.".to_string();
-                        }
-                    }
-                }
-            });
         }
 
         ui.columns(2, |cols| {
@@ -611,27 +591,14 @@ impl PretextApp {
             menu_check(&mut cols[0], &mut self.session.tooltip_on, "Tool Tip");
             menu_check(&mut cols[1], &mut self.session.invert_mouse, "Invert Mouse Buttons");
         });
-        menu_check(ui, &mut self.show_view, "View");
-
-        ui.columns(2, |cols| {
-            if menu_choice(&mut cols[0], "Ed", self.session.signal == SignalMethod::Pretext, row_h).clicked() {
-                self.session.signal = SignalMethod::Pretext;
-                self.status = "Ed gamma.".to_string();
-            }
-            if menu_choice(&mut cols[1], "Yumi", self.session.signal == SignalMethod::Yumi, row_h).clicked() {
-                self.session.signal = SignalMethod::Yumi;
-                self.status = "Yumi log scale. Weak contacts use more of the colour range.".to_string();
-            }
-        });
-        ui.label("Yumi logs the bytes between Min and Max. Mid is only used by Ed.");
 
         let mut gamma_changed = false;
         gamma_changed |= gamma_slider(ui, "Gamma Min", &mut self.session.gamma[0]);
         gamma_changed |= gamma_slider(ui, "Gamma Mid", &mut self.session.gamma[1]);
         gamma_changed |= gamma_slider(ui, "Gamma Max", &mut self.session.gamma[2]);
         if gamma_changed {
-            self.session.gamma[1] = self.session.gamma[1].clamp(self.session.gamma[0], self.session.gamma[2]);
             self.session.gamma[0] = self.session.gamma[0].min(self.session.gamma[2]);
+            self.session.gamma[1] = self.session.gamma[1].clamp(self.session.gamma[0], self.session.gamma[2]);
         }
         if menu_button(ui, "Default Gamma", row_h).clicked() {
             self.session.gamma = [0.0, 0.5, 1.0];
@@ -657,166 +624,6 @@ impl PretextApp {
                     ui.radio_value(&mut self.session.background, index, *name);
                 }
             });
-
-        ui.collapsing("Extensions", |ui| {
-            for track in &mut self.session.tracks {
-                ui.checkbox(&mut track.on, track.name.as_str());
-            }
-        });
-
-        ui.collapsing("Sort", |ui| {
-            for mode in [SortMode::UnionFind, SortMode::Fuse, SortMode::DeepFuse] {
-                ui.radio_value(&mut self.session.sort_mode, mode, mode.label());
-            }
-            ui.add(egui::Slider::new(&mut self.session.link_threshold, 0.0..=1.0).text("link threshold"));
-            ui.add(egui::Slider::new(&mut self.session.cut_threshold, 0.0..=1.0).text("cut threshold"));
-        });
-
-        let edit_count = self.session.edits.len();
-        ui.collapsing(format!("Edits ({edit_count})"), |ui| {
-            ui.columns(3, |cols| {
-                if menu_button(&mut cols[0], "Undo", row_h).clicked() {
-                    self.session.undo_edit();
-                }
-                if menu_button(&mut cols[1], "Redo", row_h).clicked() {
-                    self.session.redo_edit();
-                }
-                if menu_button(&mut cols[2], "Erase", row_h).clicked() {
-                    self.session.erase_all();
-                    self.selection.clear();
-                    self.status = "Erased edits.".to_string();
-                }
-            });
-            ui.columns(3, |cols| {
-                if menu_button(&mut cols[0], "Invert", row_h).clicked() {
-                    self.invert_current(false);
-                }
-                if menu_button(&mut cols[1], "Split", row_h).clicked() {
-                    if let Some(pixel) = self.hover_pixel {
-                        if self.session.split_pixel(pixel) {
-                            self.status = format!("Split at pixel {pixel}.");
-                        } else {
-                            self.status = "The pointer is on a fragment edge.".to_string();
-                        }
-                    }
-                }
-                if menu_button(&mut cols[2], "Glue", row_h).clicked() {
-                    let only = if self.selection.is_empty() {
-                        None
-                    } else {
-                        Some(self.selection.as_slice())
-                    };
-                    let n = self.session.glue_adjacent(only);
-                    self.status = format!("Glued {n} joins.");
-                }
-            });
-            if menu_button(ui, "Load AGP", row_h).clicked() {
-                self.pick_text(ui.ctx().clone(), "AGP", "agp", Kind::Agp);
-            }
-            if menu_button(ui, "Consolidate marked", row_h).clicked() {
-                match self.session.consolidate(&self.selection) {
-                    Ok(ids) => {
-                        self.selection = ids;
-                        self.status = "Moved the marked contigs together.".to_string();
-                    }
-                    Err(err) => self.status = err.to_string(),
-                }
-            }
-            if self.session.edits.is_empty() {
-                ui.label("No edits.");
-            }
-            for (index, edit) in self.session.edits.iter().enumerate() {
-                ui.label(format!("{}. {}", index + 1, edit.summary));
-            }
-        });
-
-        ui.collapsing("Waypoints", |ui| {
-            if self.session.waypoints.is_empty() {
-                ui.label("No waypoints.");
-            }
-            let mut jump = None;
-            let mut remove = None;
-            for (index, _) in self.session.waypoints.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    if ui.button(format!("Go {}", index + 1)).clicked() {
-                        jump = Some(index);
-                    }
-                    if ui.button("Remove").clicked() {
-                        remove = Some(index);
-                    }
-                });
-            }
-            if let Some(index) = jump {
-                self.session.jump_waypoint(index);
-            }
-            if let Some(index) = remove {
-                self.session.waypoints.remove(index);
-            }
-        });
-
-        ui.collapsing("Scaffolds", |ui| {
-            if menu_button(ui, "New scaffold", row_h).clicked() {
-                let next = self.session.fragments.iter().map(|frag| frag.scaff_id).max().unwrap_or(0) + 1;
-                self.session.paint_scaff = next;
-                self.status = format!("Scaffold {next}. Paint it in Scaffold Edit Mode.");
-            }
-            ui.add(egui::DragValue::new(&mut self.session.paint_scaff).range(0..=10_000u32).prefix("scaffold "));
-        });
-
-        ui.collapsing("Meta Data Tags", |ui| {
-            ui.checkbox(&mut self.session.meta_always, "Meta labels");
-            let names = self.session.tags.clone();
-            let mut active = self.session.active_tag.min(names.len().saturating_sub(1));
-            egui::ComboBox::from_label("Active tag")
-                .selected_text(names.get(active).cloned().unwrap_or_default())
-                .show_ui(ui, |ui| {
-                    for (index, name) in names.iter().enumerate() {
-                        ui.selectable_value(&mut active, index, name);
-                    }
-                });
-            self.session.active_tag = active;
-            let mut grey_changed = false;
-            for (index, name) in names.iter().enumerate() {
-                if let Some(on) = self.session.grey_tags.get_mut(index) {
-                    grey_changed |= ui.checkbox(on, format!("grey {name}")).changed();
-                }
-            }
-            if grey_changed {
-                self.session.bump();
-            }
-            if ui.button("Move tagged to end").clicked() {
-                let bit = 1u64 << self.session.active_tag.min(63);
-                let n = self.session.move_tags_to_end(bit);
-                self.status = format!("Moved {n} tagged fragments to the end.");
-            }
-        });
-
-        ui.collapsing("Sequences", |ui| {
-            ui.text_edit_singleline(&mut self.seq_query);
-            let query = self.seq_query.to_ascii_lowercase();
-            let mut shown = 0usize;
-            let mut focus = None;
-            for (index, frag) in self.session.fragments.iter().enumerate() {
-                if !query.is_empty() && !frag.name.to_ascii_lowercase().contains(&query) {
-                    continue;
-                }
-                shown += 1;
-                if shown > 200 {
-                    ui.label("Showing the first 200 matches.");
-                    break;
-                }
-                let marked = self.selection.contains(&frag.uid);
-                if ui.selectable_label(marked, frag.name.as_str()).clicked() {
-                    focus = Some(index);
-                }
-            }
-            if shown == 0 {
-                ui.label("No sequences.");
-            }
-            if let Some(index) = focus {
-                self.session.focus_fragment(index);
-            }
-        });
     }
 
     fn purple_button(&self, ui: &mut egui::Ui, label: &str) -> egui::Response {
@@ -848,6 +655,40 @@ impl PretextApp {
             self.session.sort_fragments(None)
         };
         self.status = format!("Pixel sort kept {links} links.");
+    }
+
+    fn fetch_map_url(&mut self, ctx: egui::Context, raw: &str) {
+        let url = match accept_map_url(raw) {
+            Ok(url) => url,
+            Err(err) => {
+                self.status = err;
+                return;
+            }
+        };
+        let name = map_name_from_url(&url);
+        self.status = format!("Fetching {name}…");
+        self.dialog_open = true;
+        let tx = self.events_tx.clone();
+        ehttp::fetch(ehttp::Request::get(&url), move |result| {
+            match result {
+                Ok(response) if response.ok => {
+                    let _ = tx.send(Msg::Pretext {
+                        name,
+                        bytes: response.bytes,
+                    });
+                }
+                Ok(response) => {
+                    let _ = tx.send(Msg::Note(format!("The link returned HTTP {}.", response.status)));
+                }
+                Err(err) => {
+                    let _ = tx.send(Msg::Note(format!(
+                        "Could not fetch the map ({err}). The server must allow this page to read the file."
+                    )));
+                }
+            }
+            let _ = tx.send(Msg::Done);
+            ctx.request_repaint();
+        });
     }
 
     fn pick_pretext(&mut self, ctx: egui::Context) {
@@ -1045,26 +886,75 @@ impl PretextApp {
         self.sync_textures(ui.ctx(), &view);
         let painter = ui.painter_at(rect);
         self.paint(&painter, &view);
+        if self.session.fragments.is_empty() && self.loader.is_none() {
+            self.empty_map_prompt(ui.ctx(), rect);
+        }
+    }
+
+    fn empty_map_prompt(&mut self, ctx: &egui::Context, rect: Rect) {
+        let hovering_file = ctx.input(|input| !input.raw.hovered_files.is_empty());
+        egui::Area::new(egui::Id::new("empty-map-prompt"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.center())
+            .pivot(egui::Align2::CENTER_CENTER)
+            .show(ctx, |ui| {
+                let fill = if hovering_file {
+                    Color32::from_rgb(44, 67, 82)
+                } else {
+                    Color32::from_rgb(36, 39, 43)
+                };
+                egui::Frame::new()
+                    .fill(fill)
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        if hovering_file {
+                            Color32::from_rgb(117, 190, 230)
+                        } else {
+                            Color32::from_rgb(88, 96, 105)
+                        },
+                    ))
+                    .inner_margin(egui::Margin::same(24))
+                    .corner_radius(8)
+                    .show(ui, |ui| {
+                        ui.set_width(320.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("Open a contact map")
+                                    .strong()
+                                    .size(22.0),
+                            );
+                            ui.add_space(8.0);
+                            ui.label("Choose a .pretext file, or drag and drop it here.");
+                            ui.add_space(16.0);
+                            if ui
+                                .add_sized(
+                                    Vec2::new(260.0, 44.0),
+                                    egui::Button::new("Choose .pretext file"),
+                                )
+                                .clicked()
+                            {
+                                self.pick_pretext(ctx.clone());
+                            }
+                            ui.add_space(8.0);
+                            ui.label("You can also open an HTTPS link from Load Map.");
+                        });
+                    });
+            });
     }
 
     fn pointer(&mut self, ui: &mut egui::Ui, view: &View, response: &egui::Response) {
-        let (edit_button, pan_button) = if self.session.invert_mouse {
-            (egui::PointerButton::Secondary, egui::PointerButton::Primary)
+        let pan_button = if self.session.invert_mouse {
+            egui::PointerButton::Primary
         } else {
-            (egui::PointerButton::Primary, egui::PointerButton::Secondary)
+            egui::PointerButton::Secondary
         };
-        let (hover, scroll, delta, edit_down, edit_pressed, edit_released, pan_down, pan_pressed, middle_pressed, shift) = ui.input(|input| {
+        let (hover, scroll, delta, pan_down, pan_pressed) = ui.input(|input| {
             (
                 input.pointer.hover_pos(),
                 input.smooth_scroll_delta.y,
                 input.pointer.delta(),
-                input.pointer.button_down(edit_button),
-                input.pointer.button_pressed(edit_button),
-                input.pointer.button_released(edit_button),
                 input.pointer.button_down(pan_button),
                 input.pointer.button_pressed(pan_button),
-                input.pointer.button_pressed(egui::PointerButton::Middle),
-                input.modifiers.shift,
             )
         });
 
@@ -1090,11 +980,7 @@ impl PretextApp {
             self.hover_pixel = None;
         }
 
-        if middle_pressed && self.session.mode == Mode::Edit && self.hover_pixel.is_some() {
-            self.invert_current(true);
-        }
-
-        if pan_pressed && hover.is_some_and(|pos| view.rect.contains(pos)) {
+        if pan_pressed && response.hovered() {
             self.panning = true;
         }
         if self.panning {
@@ -1107,52 +993,6 @@ impl PretextApp {
             }
         }
 
-        let over_map = hover.filter(|pos| view.map_rect(self.session.camera).contains(*pos));
-        if edit_pressed {
-            if let Some(pos) = over_map {
-                if let Some(pixel) = pixel_of(&self.session, view.screen_to_world(self.session.camera, pos).x) {
-                    self.press = Some(Press {
-                        pixel,
-                        origin: pos,
-                        moved: false,
-                    });
-                }
-            }
-        }
-        if edit_down {
-            if let Some(press) = &mut self.press {
-                if let Some(pos) = hover {
-                    if pos.distance(press.origin) > 4.0 {
-                        press.moved = true;
-                    }
-                }
-            }
-            if self.session.mode == Mode::Edit && self.press.as_ref().is_some_and(|press| press.moved) {
-                let dest = hover.and_then(|pos| pixel_of(&self.session, view.screen_to_world(self.session.camera, pos).x));
-                self.drag_edit(dest);
-            }
-        } else if edit_released {
-            if let Some(press) = self.press.take() {
-                let end = hover
-                    .map(|pos| view.screen_to_world(self.session.camera, pos))
-                    .and_then(|world| pixel_of(&self.session, world.x))
-                    .unwrap_or(press.pixel);
-                if self.grab_armed && self.grab_dest.is_some() {
-                    let count = self.selection.len();
-                    self.session.note_edit(format!("moved {count} fragment(s)"));
-                    self.status = format!("Moved {count} fragment(s).");
-                    self.grab_armed = false;
-                    self.grab_dest = None;
-                } else {
-                    if self.grab_armed {
-                        self.session.disarm_edit();
-                        self.grab_armed = false;
-                        self.grab_dest = None;
-                    }
-                    self.finish_press(press, end, shift);
-                }
-            }
-        }
     }
 
     fn drag_edit(&mut self, dest: Option<u32>) {
@@ -1281,17 +1121,14 @@ impl PretextApp {
             }
         }
         self.paint_fragments(painter, view, map);
-        self.paint_selection(painter, view, map);
         self.paint_contig_labels(painter, view);
         self.paint_waypoints(painter, view);
-        self.paint_tracks(painter, view);
         if self.session.scale_on {
             self.paint_scale(painter, view);
         }
         if self.session.tooltip_on {
             self.paint_tooltip(painter, view);
         }
-        self.paint_extension_overlay(painter, view);
     }
 
     fn paint_extension_overlay(&self, painter: &egui::Painter, view: &View) {
@@ -1623,7 +1460,6 @@ impl eframe::App for PretextApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| self.map_view(ui));
-        paint_mode_help(ctx, self.session.mode, &mut self.show_view);
     }
 }
 
@@ -1798,6 +1634,12 @@ fn gamma_slider(ui: &mut egui::Ui, label: &str, value: &mut f32) -> bool {
         .changed()
     })
     .inner
+}
+
+enum SuggestAct {
+    Show,
+    Accept,
+    Skip,
 }
 
 enum Kind {
@@ -2060,5 +1902,299 @@ fn format_bp(bp: f32) -> String {
         format!("{:.0} kb", bp / 1_000.0)
     } else {
         format!("{bp:.0} bp")
+    }
+}
+
+fn accept_map_url(raw: &str) -> Result<String, String> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return Err("Enter an https link.".to_string());
+    }
+    if !url.to_ascii_lowercase().starts_with("https://") {
+        return Err("The link has to start with https://.".to_string());
+    }
+    if url.len() <= "https://".len() {
+        return Err("That link has no host.".to_string());
+    }
+    Ok(url.to_string())
+}
+
+fn map_name_from_url(url: &str) -> String {
+    let path = url.split('?').next().unwrap_or(url);
+    let name = path.rsplit('/').next().unwrap_or("").trim();
+    if name.is_empty() || name.contains(':') {
+        "map.pretext".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+#[cfg(test)]
+mod viewer_tests {
+    use super::*;
+
+    fn input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 1800.0))),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn pointer_frame(app: &mut PretextApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let _ = ctx.run(input(events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.available_rect_before_wrap();
+                let response = ui.allocate_rect(rect, Sense::click_and_drag());
+                let view = View::new(rect, app.session.camera.zoom);
+                app.pointer(ui, &view, &response);
+            });
+        });
+    }
+
+    fn pointer_button(button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: Pos2::new(200.0, 200.0),
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn menu_contains_only_viewing_controls() {
+        fn collect_text(shape: &egui::epaint::Shape, labels: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => labels.push(text.galley.job.text.clone()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, labels);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = PretextApp::initial_state();
+        let output = ctx.run(input(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.options(ui));
+        });
+        let mut labels = Vec::new();
+        for shape in output.shapes {
+            collect_text(&shape.shape, &mut labels);
+        }
+        let mut expected = vec![
+            "Esc", "Dark", "Black", "White", "Red", "Blue", "Load Map",
+            "Waypoints Always Visible", "Scaffolds Always Visible", "Contig Name Labels",
+            "Scale Bars", "Grid", "ID Bars", "Tool Tip", "Invert Mouse Buttons",
+            "Gamma Min", "Gamma Mid", "Gamma Max", "Default Gamma", "Colour Maps", "Background",
+        ];
+        expected.extend(NAMES.iter().copied());
+        expected.extend(BACKGROUNDS.iter().map(|(name, _)| *name));
+        for label in &expected {
+            assert!(labels.iter().any(|text| text == label), "missing control: {label}");
+        }
+        for label in &labels {
+            assert!(
+                label.is_empty() || expected.contains(&label.as_str()) || label.parse::<f32>().is_ok(),
+                "unexpected menu text: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_hides_and_restores_menu_even_with_text_focus() {
+        let ctx = egui::Context::default();
+        let mut app = PretextApp::initial_state();
+        let _ = ctx.run(input(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.text_edit_singleline(&mut app.map_url).request_focus();
+            });
+        });
+        for visible in [false, true] {
+            let _ = ctx.run(input(vec![key_event(egui::Key::Escape, egui::Modifiers::NONE)]), |ctx| {
+                app.keys(ctx);
+            });
+            assert_eq!(app.show_panel, visible);
+        }
+    }
+
+    #[test]
+    fn removed_shortcuts_do_not_change_map_or_mode() {
+        let ctx = egui::Context::default();
+        let mut app = PretextApp::initial_state();
+        app.session = Session::demo();
+        let before = app.session.save_json();
+        let mut events: Vec<_> = [
+            egui::Key::E, egui::Key::I, egui::Key::X, egui::Key::V, egui::Key::Space,
+            egui::Key::H, egui::Key::Num3, egui::Key::Num5,
+            egui::Key::C, egui::Key::G, egui::Key::R,
+        ].into_iter().map(|key| key_event(key, egui::Modifiers::NONE)).collect();
+        events.push(key_event(egui::Key::Z, egui::Modifiers::COMMAND));
+        let _ = ctx.run(input(events), |ctx| app.keys(ctx));
+        assert_eq!(app.session.mode, Mode::Normal);
+        assert_eq!(app.session.save_json(), before);
+        assert!(!app.show_view);
+    }
+
+    #[test]
+    fn retained_label_and_tooltip_shortcuts_work() {
+        let ctx = egui::Context::default();
+        let mut app = PretextApp::initial_state();
+        let _ = ctx.run(input(vec![
+            key_event(egui::Key::N, egui::Modifiers::NONE),
+            key_event(egui::Key::T, egui::Modifiers::NONE),
+        ]), |ctx| app.keys(ctx));
+        assert!(!app.session.labels_on);
+        assert!(!app.session.tooltip_on);
+    }
+
+    #[test]
+    fn panning_respects_inverted_mouse_buttons_without_editing() {
+        for invert in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = PretextApp::initial_state();
+            app.session = Session::demo();
+            app.session.invert_mouse = invert;
+            let before = app.session.to_agp();
+            let camera = app.session.camera;
+            let pan = if invert { egui::PointerButton::Primary } else { egui::PointerButton::Secondary };
+            pointer_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(Pos2::new(200.0, 200.0))]);
+            pointer_frame(&mut app, &ctx, vec![pointer_button(pan, true)]);
+            pointer_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(Pos2::new(250.0, 230.0))]);
+            pointer_frame(&mut app, &ctx, vec![pointer_button(pan, false)]);
+            assert_ne!(app.session.camera.x, camera.x);
+            assert_ne!(app.session.camera.y, camera.y);
+            assert_eq!(app.session.to_agp(), before);
+            assert!(app.selection.is_empty());
+            assert!(app.session.edits.is_empty());
+        }
+    }
+
+    #[test]
+    fn clicking_dragging_and_middle_click_cannot_edit_or_select() {
+        let ctx = egui::Context::default();
+        let mut app = PretextApp::initial_state();
+        app.session = Session::demo();
+        app.session.mode = Mode::Edit;
+        app.hover_pixel = Some(10);
+        let before = app.session.save_json();
+        for button in [egui::PointerButton::Primary, egui::PointerButton::Middle] {
+            pointer_frame(&mut app, &ctx, vec![
+                egui::Event::PointerMoved(Pos2::new(200.0, 200.0)),
+                pointer_button(button, true),
+            ]);
+            pointer_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(Pos2::new(250.0, 230.0))]);
+            pointer_frame(&mut app, &ctx, vec![pointer_button(button, false)]);
+        }
+        assert_eq!(app.session.save_json(), before);
+        assert!(app.selection.is_empty());
+        assert!(app.press.is_none());
+    }
+
+    #[test]
+    fn dropped_state_and_agp_files_are_rejected() {
+        let mut app = PretextApp::initial_state();
+        let before = app.session.save_json();
+        for name in ["state.json", "assembly.agp"] {
+            app.ingest(name, Vec::new());
+            assert!(app.status.contains("Only .pretext"));
+            assert_eq!(app.session.save_json(), before);
+            assert!(app.loader.is_none());
+        }
+    }
+
+    #[test]
+    fn loading_a_map_stays_in_viewing_mode() {
+        use std::io::Write;
+
+        fn deflate(bytes: &[u8]) -> Vec<u8> {
+            let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(bytes).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&1000u64.to_le_bytes());
+        header.extend_from_slice(&1u32.to_le_bytes());
+        header.extend_from_slice(&1.0f32.to_le_bytes());
+        let mut name = [0u8; 64];
+        name[..4].copy_from_slice(b"chr1");
+        header.extend_from_slice(&name);
+        header.extend_from_slice(&[2, 0, 1]);
+        let compressed = deflate(&header);
+        let tile = deflate(&[200, 0, 0, 0, 0, 0, 0, 0]);
+        let mut bytes = b"pstm".to_vec();
+        bytes.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&compressed);
+        bytes.extend_from_slice(&(tile.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&tile);
+
+        let mut app = PretextApp::initial_state();
+        app.ingest("tiny.PRETEXT", bytes);
+        assert!(app.loader.is_some(), "{}", app.status);
+        assert_eq!(app.session.mode, Mode::Normal);
+        let ctx = egui::Context::default();
+        for _ in 0..10 {
+            app.pump_loader(&ctx);
+            if app.loader.is_none() {
+                break;
+            }
+        }
+        assert!(app.loader.is_none(), "map loading did not finish");
+        assert_eq!(app.session.mode, Mode::Normal);
+        assert_eq!(app.session.fragments.len(), 1);
+        assert_eq!(app.session.fragments[0].name, "chr1");
+        assert_eq!(app.session.map_pixels, 4);
+        assert!(app.status.contains("Loaded tiny.PRETEXT"), "{}", app.status);
+        assert!(!app.status.contains("pick it up"));
+    }
+
+    #[test]
+    fn scroll_still_zooms_the_map() {
+        let ctx = egui::Context::default();
+        let mut app = PretextApp::initial_state();
+        let zoom = app.session.camera.zoom;
+        pointer_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(Pos2::new(200.0, 200.0))]);
+        pointer_frame(&mut app, &ctx, vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: Vec2::new(0.0, 100.0),
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(app.session.camera.zoom > zoom);
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::{accept_map_url, map_name_from_url};
+
+    #[test]
+    fn https_link_keeps_the_file_name() {
+        let url = accept_map_url(
+            "  https://bucket.s3.amazonaws.com/maps/gf.pretext?X-Amz-Signature=abc  ",
+        )
+        .unwrap();
+        assert_eq!(map_name_from_url(&url), "gf.pretext");
+    }
+
+    #[test]
+    fn other_schemes_are_refused() {
+        assert!(accept_map_url("ftp://files.example/map.pretext").is_err());
+        assert!(accept_map_url("http://example.com/map.pretext").is_err());
+        assert!(accept_map_url("s3://bucket/map.pretext").is_err());
+        assert!(accept_map_url("   ").is_err());
     }
 }
