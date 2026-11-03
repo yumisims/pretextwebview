@@ -18,7 +18,7 @@ The `static` branch exposes only these viewing controls. Editing, sorting, sugge
 
 ## What does not match PretextView -- a lot yet
 
-- The colour-map names match PretextView's menu. The ramps themselves are short stand-ins, not PretextView's original 256-colour tables.
+- All 35 original colour-map entries use PretextView's full 256-colour tables and nearest-entry lookup, in the original menu order. `Copy_texture(always at end)` uses the original red-channel ramp; `Fall` remains an additional local palette. Gamma and Pretext/Yumi display curves are unchanged, so the overall rendering is not guaranteed to match PretextView.
 - Contigs shorter than one pixel of the full-resolution map are left out of the sequence list.
 - The browser keeps the file, an overview of at most 2048 pixels on a side, and a small cache of finer tiles. It does not hold the multi-gigabyte working set PretextView builds. A very large map can fail to open in the browser.
 
@@ -43,3 +43,7 @@ trunk serve --release --address 127.0.0.1 --port 8080
 ```
 
 Open http://127.0.0.1:8080. `trunk build --release` writes the site to `dist/` without serving it.
+
+## Colour-map attribution
+
+The 35 original colour-map tables are from [PretextView's ColorMapData.cpp](https://github.com/sanger-tol/PretextView/blob/c64fd08a1f60b5dfa1cf982f12b962ad453ae17e/src/ColorMapData.cpp), copyright (c) 2021 Ed Harry, Wellcome Sanger Institute, used under the MIT licence. The copyright and permission notice are retained alongside the tables in `src/colormap.rs`.
