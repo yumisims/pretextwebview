@@ -335,6 +335,19 @@ fn bin_center(bin: u32, side: u32, map: u32) -> u32 {
     ((start + end - 1) / 2).min(map.saturating_sub(1) as u64) as u32
 }
 
+/// Mip whose texel is about one sample. A denser grid (a closer zoom, or a
+/// larger screen) selects a finer level, so the blocks on screen get smaller.
+fn contact_mip(span_x: f32, span_y: f32, cols: u32, rows: u32) -> u32 {
+    let step_x = span_x / cols.max(1) as f32;
+    let step_y = span_y / rows.max(1) as f32;
+    let step = step_x.min(step_y).max(0.0);
+    if step <= 1.0 {
+        0
+    } else {
+        step.log2().floor() as u32
+    }
+}
+
 fn overview_index(mapped: u32, side: u32, full: u32) -> usize {
     if side == full {
         return mapped as usize;
@@ -1163,15 +1176,19 @@ impl Session {
         (pixel as f32 + 0.5) / self.map_pixels.max(1) as f32 - 0.5
     }
 
-    pub fn wants_detail(&self, view_min: f32) -> bool {
+    /// `view_min_px` is the shorter side of the view in device pixels.
+    /// `span_x` and `span_y` are the visible map width and height in map pixels.
+    pub fn wants_detail(&self, view_min_px: f32, span_x: f32, span_y: f32) -> bool {
         let Some(contacts) = &self.contacts else {
             return false;
         };
         if contacts.overview_side == 0 || contacts.overview_mip == 0 || !contacts.has_source() {
             return false;
         }
-        let screen_per_texel = view_min * self.camera.zoom / contacts.overview_side as f32;
-        screen_per_texel > 3.0
+        let screen_per_texel = view_min_px * self.camera.zoom / contacts.overview_side as f32;
+        // Refine as soon as an overview texel would cover more than one screen
+        // pixel, and only when the window is a modest set of tiles.
+        screen_per_texel > 1.05 && contacts.covers_few_tiles(span_x, span_y)
     }
 
     /// Suggested AGP download name: the map file without its `.pretext` suffix.
@@ -1493,43 +1510,67 @@ impl Session {
         }
     }
 
-    pub fn raster_window(&self, mut x0: f32, mut y0: f32, mut x1: f32, mut y1: f32, samples: u32) -> Vec<u8> {
-        let samples = samples.max(2);
+    /// RGBA of the visible window. `cols` and `rows` are the screen size of
+    /// that window, so one sample is about one device pixel and a closer zoom
+    /// reads a finer mip instead of stretching the same blocks.
+    pub fn raster_window(&self, mut x0: f32, mut y0: f32, mut x1: f32, mut y1: f32, cols: u32, rows: u32) -> Vec<u8> {
+        let cols = cols.max(2);
+        let rows = rows.max(2);
         x0 = x0.min(x1);
         y0 = y0.min(y1);
-        x1 = x1.max(x0 + 1e-4);
-        y1 = y1.max(y0 + 1e-4);
+        x1 = x1.max(x0 + 1e-6);
+        y1 = y1.max(y0 + 1e-6);
         let prefix = self.prefix_sums();
-        let span = ((x1 - x0).max(y1 - y0) * self.map_pixels.max(1) as f32).max(1.0);
-        let step = span / samples as f32;
-        let mip = if step <= 1.0 {
-            0
-        } else {
-            step.log2().floor().max(0.0) as u32
-        };
-        let mut rgba = vec![0u8; (samples as usize) * (samples as usize) * 4];
-        for row in 0..samples {
-            let world_y = y0 + (y1 - y0) * (row as f32 + 0.5) / samples as f32;
-            let display_y = self.world_to_pixel(world_y);
-            let (orig_y, iy) = self.original_pixel(display_y, &prefix);
-            for col in 0..samples {
-                let world_x = x0 + (x1 - x0) * (col as f32 + 0.5) / samples as f32;
-                let display_x = self.world_to_pixel(world_x);
-                let (orig_x, ix) = self.original_pixel(display_x, &prefix);
-                let mut value = self
-                    .contacts
-                    .as_ref()
-                    .map(|contacts| contacts.sample(orig_x, orig_y, mip) as f32 / 255.0)
-                    .unwrap_or(0.0);
-                if self.is_grey(ix) || self.is_grey(iy) {
-                    value *= 0.2;
-                }
-                let px = self.color_of(value);
-                let offset = ((row * samples + col) * 4) as usize;
+        let map = self.map_pixels.max(1) as f32;
+        let mip = contact_mip((x1 - x0) * map, (y1 - y0) * map, cols, rows);
+        let mut orig_x = vec![0u32; cols as usize];
+        let mut grey_x = vec![false; cols as usize];
+        for col in 0..cols {
+            let world_x = x0 + (x1 - x0) * (col as f32 + 0.5) / cols as f32;
+            let (orig, index) = self.original_pixel(self.world_to_pixel(world_x), &prefix);
+            orig_x[col as usize] = orig;
+            grey_x[col as usize] = self.is_grey(index);
+        }
+        let mut orig_y = vec![0u32; rows as usize];
+        let mut grey_y = vec![false; rows as usize];
+        for row in 0..rows {
+            let world_y = y0 + (y1 - y0) * (row as f32 + 0.5) / rows as f32;
+            let (orig, index) = self.original_pixel(self.world_to_pixel(world_y), &prefix);
+            orig_y[row as usize] = orig;
+            grey_y[row as usize] = self.is_grey(index);
+        }
+        let values = self
+            .contacts
+            .as_ref()
+            .map(|contacts| contacts.sample_grid(&orig_x, &orig_y, mip))
+            .unwrap_or_default();
+        let lut = self.color_lut(1.0);
+        let grey_lut = self.color_lut(0.2);
+        let mut rgba = vec![0u8; (cols as usize) * (rows as usize) * 4];
+        if values.len() != (cols as usize) * (rows as usize) {
+            return rgba;
+        }
+        for row in 0..rows as usize {
+            for col in 0..cols as usize {
+                let value = values[row * cols as usize + col] as usize;
+                let px = if grey_x[col] || grey_y[row] {
+                    grey_lut[value]
+                } else {
+                    lut[value]
+                };
+                let offset = (row * cols as usize + col) * 4;
                 rgba[offset..offset + 4].copy_from_slice(&px);
             }
         }
         rgba
+    }
+
+    fn color_lut(&self, gain: f32) -> [[u8; 4]; 256] {
+        let mut lut = [[0u8; 4]; 256];
+        for (i, px) in lut.iter_mut().enumerate() {
+            *px = self.color_of(i as f32 / 255.0 * gain);
+        }
+        lut
     }
 
     fn raster_synthetic(&self) -> Vec<u8> {
@@ -1940,6 +1981,14 @@ pub fn contact_at(session: &Session, x: u32, y: u32, index: &[usize]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_denser_screen_grid_selects_a_finer_mip() {
+        let coarse = contact_mip(8_000.0, 8_000.0, 320, 320);
+        let fine = contact_mip(8_000.0, 8_000.0, 1_600, 1_600);
+        assert!(fine < coarse, "mip {coarse} did not get finer at screen resolution ({fine})");
+        assert_eq!(contact_mip(100.0, 100.0, 400, 400), 0);
+    }
 
     #[test]
     fn demo_covers_the_map_and_is_shuffled() {

@@ -22,6 +22,9 @@ use crate::model::TrackKind;
 
 const OVERVIEW_LIMIT: u32 = 2048;
 const TILE_COMPRESSED_LIMIT: usize = 32 * 1024 * 1024;
+/// Tiles decoded for one screen-resolution view. Coarser mips are small, and
+/// a close view only covers a handful of tiles.
+const DETAIL_TILE_BUDGET: usize = 128;
 
 #[derive(Clone, Debug)]
 pub struct DecodedContig {
@@ -76,6 +79,15 @@ impl ContactMap {
             .unwrap_or(0)
     }
 
+    /// The visible span is small enough that a screen-resolution pass can
+    /// decode its tiles without walking the whole map.
+    pub fn covers_few_tiles(&self, span_x: f32, span_y: f32) -> bool {
+        let res = self.texture_res.max(1) as f32;
+        let nx = (span_x / res).ceil().clamp(1.0, 100_000.0);
+        let ny = (span_y / res).ceil().clamp(1.0, 100_000.0);
+        nx * ny <= DETAIL_TILE_BUDGET as f32
+    }
+
     /// Sample the contact between two original-file pixels. `mip` 0 is the
     /// finest stored level.
     pub fn sample(&self, full_x: u32, full_y: u32, mip: u32) -> u8 {
@@ -86,27 +98,18 @@ impl ContactMap {
         if mip >= self.overview_mip {
             return self.overview_at(full_x, full_y);
         }
-        let res = self.texture_res;
-        let mut px = full_x.min(self.map_pixels - 1);
-        let mut py = full_y.min(self.map_pixels - 1);
-        let mut tx = (px / res) as u16;
-        let mut ty = (py / res) as u16;
-        if tx > ty {
-            std::mem::swap(&mut px, &mut py);
-            std::mem::swap(&mut tx, &mut ty);
-        }
-        let lr = res >> mip;
-        if lr == 0 {
+        let px = full_x.min(self.map_pixels - 1);
+        let py = full_y.min(self.map_pixels - 1);
+        let loc = texel_loc(px, py, self.texture_res, mip);
+        if loc.lr == 0 {
             return 0;
         }
-        let lx = (px % res) >> mip;
-        let ly = (py % res) >> mip;
-        let key = ((tx as u32) << 16 | ty as u32, mip as u8);
+        let key = ((loc.tx as u32) << 16 | loc.ty as u32, mip as u8);
         if let Some(buf) = self.cache.borrow().get(&key) {
-            return buf.get((ly * lr + lx) as usize).copied().unwrap_or(0);
+            return buf.get((loc.ly * loc.lr + loc.lx) as usize).copied().unwrap_or(0);
         }
-        let decoded = self.decode_level(tx, ty, mip, lr);
-        let value = decoded.get((ly * lr + lx) as usize).copied().unwrap_or(0);
+        let decoded = self.decode_level(loc.tx, loc.ty, mip, loc.lr);
+        let value = decoded.get((loc.ly * loc.lr + loc.lx) as usize).copied().unwrap_or(0);
         let mut cache = self.cache.borrow_mut();
         if cache.len() >= 48 {
             let old = cache.keys().next().copied();
@@ -116,6 +119,54 @@ impl ContactMap {
         }
         cache.insert(key, decoded);
         value
+    }
+
+    /// Contact bytes for every pair in `xs` × `ys`, row-major. One decode per
+    /// tile, so a zoomed-in window can be filled at screen resolution.
+    pub fn sample_grid(&self, xs: &[u32], ys: &[u32], mip: u32) -> Vec<u8> {
+        let mut out = vec![0u8; xs.len().saturating_mul(ys.len())];
+        if xs.is_empty() || ys.is_empty() {
+            return out;
+        }
+        let use_overview = self.map_pixels == 0
+            || self.texture_res == 0
+            || self.bytes.is_empty()
+            || mip.min(self.mips.saturating_sub(1)) >= self.overview_mip;
+        if use_overview {
+            for (row, &y) in ys.iter().enumerate() {
+                for (col, &x) in xs.iter().enumerate() {
+                    out[row * xs.len() + col] = self.overview_at(x, y);
+                }
+            }
+            return out;
+        }
+        let mip = mip.min(self.mips.saturating_sub(1));
+        let res = self.texture_res;
+        let lr = res >> mip;
+        if lr == 0 {
+            return out;
+        }
+        let mut decoded: HashMap<(u16, u16), Vec<u8>> = HashMap::new();
+        for (row, &y) in ys.iter().enumerate() {
+            let py = y.min(self.map_pixels - 1);
+            for (col, &x) in xs.iter().enumerate() {
+                let px = x.min(self.map_pixels - 1);
+                let loc = texel_loc(px, py, res, mip);
+                let key = (loc.tx, loc.ty);
+                let value = if let Some(buf) = decoded.get(&key) {
+                    buf.get((loc.ly * lr + loc.lx) as usize).copied().unwrap_or(0)
+                } else if decoded.len() >= DETAIL_TILE_BUDGET {
+                    self.overview_at(px, py)
+                } else {
+                    let buf = self.decode_level(loc.tx, loc.ty, mip, lr);
+                    let value = buf.get((loc.ly * lr + loc.lx) as usize).copied().unwrap_or(0);
+                    decoded.insert(key, buf);
+                    value
+                };
+                out[row * xs.len() + col] = value;
+            }
+        }
+        out
     }
 
     fn decode_level(&self, tx: u16, ty: u16, mip: u32, level_res: u32) -> Vec<u8> {
@@ -617,6 +668,30 @@ fn blit_tile(overview: &mut [u8], side: u32, tx: u32, ty: u32, src_res: u32, lev
     }
 }
 
+struct TexelLoc {
+    tx: u16,
+    ty: u16,
+    lx: u32,
+    ly: u32,
+    lr: u32,
+}
+
+fn texel_loc(mut px: u32, mut py: u32, res: u32, mip: u32) -> TexelLoc {
+    let mut tx = (px / res) as u16;
+    let mut ty = (py / res) as u16;
+    if tx > ty {
+        std::mem::swap(&mut px, &mut py);
+        std::mem::swap(&mut tx, &mut ty);
+    }
+    TexelLoc {
+        tx,
+        ty,
+        lx: (px % res) >> mip,
+        ly: (py % res) >> mip,
+        lr: res >> mip,
+    }
+}
+
 fn mip_byte_offset(texture_res: u32, mip: u32) -> usize {
     let mut offset = 0usize;
     let mut res = texture_res;
@@ -859,6 +934,8 @@ mod tests {
         assert_eq!(loaded.genome_bp, 1_000);
         assert!(pixels(&loaded.contacts).iter().all(|p| *p == 200));
         assert_eq!(loaded.contacts.sample(1, 2, 0), 200);
+        let grid = loaded.contacts.sample_grid(&[1, 2], &[1, 2], 0);
+        assert_eq!(grid, vec![200, 200, 200, 200]);
     }
 
     #[test]
@@ -881,6 +958,8 @@ mod tests {
         assert_eq!(at(1, 5), 255);
         assert_eq!(at(5, 1), 255);
         assert_eq!(at(6, 6), 0);
+        let grid = loaded.contacts.sample_grid(&[1, 5], &[1, 5], 0);
+        assert_eq!(grid, vec![0, 255, 255, 0]);
     }
 
     #[test]

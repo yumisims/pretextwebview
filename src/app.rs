@@ -24,6 +24,8 @@ struct Detail {
     y0: f32,
     x1: f32,
     y1: f32,
+    cols: u32,
+    rows: u32,
     key: TexKey,
     window: [i32; 4],
     tex: egui::TextureHandle,
@@ -253,10 +255,17 @@ impl PretextApp {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let (tooltip, names) = ctx.input(|input| {
+        let (tooltip, names, left, right, up, down) = ctx.input(|input| {
             let plain = !input.modifiers.command && !input.modifiers.alt;
             let key = |key| plain && input.key_pressed(key);
-            (key(egui::Key::T), key(egui::Key::N))
+            (
+                key(egui::Key::T),
+                key(egui::Key::N),
+                key(egui::Key::ArrowLeft),
+                key(egui::Key::ArrowRight),
+                key(egui::Key::ArrowUp),
+                key(egui::Key::ArrowDown),
+            )
         });
         if tooltip {
             self.session.tooltip_on = !self.session.tooltip_on;
@@ -264,6 +273,57 @@ impl PretextApp {
         if names {
             self.session.labels_on = !self.session.labels_on;
         }
+        // PretextView: Left / Right step Gamma mid by 0.05, Up / Down cycle the colour map.
+        // Holding the key repeats, matching GLFW key-repeat.
+        if left {
+            self.step_gamma_mid(-1);
+        }
+        if right {
+            self.step_gamma_mid(1);
+        }
+        if up {
+            self.step_colormap(1);
+        }
+        if down {
+            self.step_colormap(-1);
+        }
+    }
+
+    fn step_gamma_mid(&mut self, dir: i32) {
+        let delta = if dir > 0 { 0.05 } else { -0.05 };
+        let low = self.session.gamma[0];
+        let high = self.session.gamma[2];
+        let mid = (self.session.gamma[1] + delta).clamp(low, high);
+        self.session.gamma[1] = ((mid * 100.0).round() / 100.0).clamp(low, high);
+        self.status = format!("Gamma mid {:.2}", self.session.gamma[1]);
+    }
+
+    fn step_colormap(&mut self, dir: i32) {
+        let n = NAMES.len();
+        if n == 0 {
+            return;
+        }
+        let order: Vec<usize> = if self.session.use_custom_colormap_order {
+            self.session
+                .colormap_order
+                .iter()
+                .copied()
+                .filter(|index| *index < n)
+                .collect()
+        } else {
+            (0..n).collect()
+        };
+        if order.is_empty() {
+            return;
+        }
+        let current = order.iter().position(|index| *index == self.session.colormap).unwrap_or(0);
+        let next = if dir > 0 {
+            (current + 1) % order.len()
+        } else {
+            (current + order.len() - 1) % order.len()
+        };
+        self.session.colormap = order[next];
+        self.status = format!("Colour map: {}", NAMES[self.session.colormap]);
     }
 
     fn cut_at_hover(&mut self) {
@@ -604,6 +664,7 @@ impl PretextApp {
             self.session.gamma = [0.0, 0.5, 1.0];
             self.session.bump();
         }
+        ui.label("Left / Right: Gamma mid    Up / Down: colour map");
 
         ui.add_space(4.0);
         egui::containers::collapsing_header::CollapsingState::load_with_default_open(
@@ -816,7 +877,12 @@ impl PretextApp {
     fn sync_textures(&mut self, ctx: &egui::Context, view: &View) {
         let key = tex_key(&self.session);
         if self.overview_key != Some(key) {
-            let (side, rgba) = self.session.raster_rgba(1024);
+            // While tiles are still streaming, keep the preview small. Once
+            // the file is in, upload the full overview (at most 2048²) so a
+            // zoomed-out map is one texel per overview pixel, not a stretched
+            // thumbnail.
+            let max_side = if self.loader.is_some() { 512 } else { 2048 };
+            let (side, rgba) = self.session.raster_rgba(max_side);
             let pixels = (side as usize).saturating_mul(side as usize).saturating_mul(4);
             if side > 0 && rgba.len() == pixels {
                 let image = egui::ColorImage::from_rgba_unmultiplied([side as usize, side as usize], &rgba);
@@ -830,18 +896,34 @@ impl PretextApp {
         }
 
         let pointer_down = ctx.input(|input| input.pointer.any_down());
-        let view_min = view.rect.width().min(view.rect.height());
-        if pointer_down || self.loader.is_some() || !self.session.wants_detail(view_min) {
+        let (x0, y0, x1, y1) = view.visible_world(self.session.camera);
+        let ppp = ctx.pixels_per_point().max(1.0);
+        let view_min = view.rect.width().min(view.rect.height()) * ppp;
+        let map = self.session.map_pixels.max(1) as f32;
+        let span_x = (x1 - x0).abs() * map;
+        let span_y = (y1 - y0).abs() * map;
+        let wants = self.session.wants_detail(view_min, span_x, span_y);
+        // The close-up is only for the current window. Once the view is far
+        // enough that the overview is the right resolution, drop it so that
+        // rectangle does not stay sharp on top of the zoomed-out map.
+        if !wants && !pointer_down && self.loader.is_none() {
+            self.detail = None;
+        }
+        if pointer_down || self.loader.is_some() || !wants {
             return;
         }
-        let (x0, y0, x1, y1) = view.visible_world(self.session.camera);
+        let near = view.world_to_screen(self.session.camera, Vec2::new(x0, y0));
+        let far = view.world_to_screen(self.session.camera, Vec2::new(x1, y1));
+        let (cols, rows) = detail_resolution(far.x - near.x, far.y - near.y, ppp);
         let window = [
             quant(x0),
             quant(y0),
             quant(x1),
             quant(y1),
         ];
-        if self.detail.as_ref().is_some_and(|detail| detail.key == key && detail.window == window) {
+        if self.detail.as_ref().is_some_and(|detail| {
+            detail.key == key && detail.window == window && detail.cols == cols && detail.rows == rows
+        }) {
             return;
         }
         let settled = self.detail.as_ref().map(|detail| detail.key) == Some(key);
@@ -849,13 +931,12 @@ impl PretextApp {
             ctx.request_repaint_after(Duration::from_millis(150));
             return;
         }
-        let samples = view.rect.width().min(view.rect.height()).round().clamp(96.0, 320.0) as u32;
-        let rgba = self.session.raster_window(x0, y0, x1, y1, samples);
-        let pixels = (samples as usize) * (samples as usize) * 4;
+        let rgba = self.session.raster_window(x0, y0, x1, y1, cols, rows);
+        let pixels = (cols as usize) * (rows as usize) * 4;
         if rgba.len() != pixels {
             return;
         }
-        let image = egui::ColorImage::from_rgba_unmultiplied([samples as usize, samples as usize], &rgba);
+        let image = egui::ColorImage::from_rgba_unmultiplied([cols as usize, rows as usize], &rgba);
         let tex = if let Some(detail) = &mut self.detail {
             detail.tex.set(image, egui::TextureOptions::NEAREST);
             detail.tex.clone()
@@ -867,6 +948,8 @@ impl PretextApp {
             y0,
             x1,
             y1,
+            cols,
+            rows,
             key,
             window,
             tex,
@@ -1109,7 +1192,13 @@ impl PretextApp {
             );
         }
         if let Some(detail) = &self.detail {
-            if detail.key == tex_key(&self.session) {
+            let (x0, y0, x1, y1) = view.visible_world(self.session.camera);
+            // A zoom-out makes the visible map larger than the close-up. Keep
+            // that image only while it still covers the whole view, so the old
+            // rectangle is not drawn during the short wait for the next frame.
+            if detail.key == tex_key(&self.session)
+                && detail_covers(detail.x0, detail.y0, detail.x1, detail.y1, x0, y0, x1, y1)
+            {
                 let a = view.world_to_screen(self.session.camera, Vec2::new(detail.x0, detail.y0));
                 let b = view.world_to_screen(self.session.camera, Vec2::new(detail.x1, detail.y1));
                 painter.image(
@@ -1817,6 +1906,22 @@ fn quant(value: f32) -> i32 {
     (value * 10_000.0).round() as i32
 }
 
+/// The close-up still covers the visible map. A zoom-out grows the visible
+/// span past the stored rectangle and must not keep painting it.
+fn detail_covers(dx0: f32, dy0: f32, dx1: f32, dy1: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> bool {
+    quant(x0) >= quant(dx0) && quant(y0) >= quant(dy0) && quant(x1) <= quant(dx1) && quant(y1) <= quant(dy1)
+}
+
+/// One contact sample per device pixel, so zooming in reveals a finer mip
+/// instead of enlarging the same squares. The cap keeps a 4K window from
+/// rasterising the whole display on the UI thread.
+fn detail_resolution(screen_w: f32, screen_h: f32, pixels_per_point: f32) -> (u32, u32) {
+    const MAX_SIDE: f32 = 2048.0;
+    let ppp = pixels_per_point.max(1.0);
+    let axis = |screen: f32| (screen.abs() * ppp).round().clamp(2.0, MAX_SIDE) as u32;
+    (axis(screen_w), axis(screen_h))
+}
+
 fn coord_label(session: &Session, world: f32) -> String {
     let map = session.map_pixels.max(1) as f64;
     let exact = ((world as f64 + 0.5) * map).clamp(0.0, map - 1e-6);
@@ -1998,7 +2103,9 @@ mod viewer_tests {
             "Esc", "Dark", "Black", "White", "Red", "Blue", "Load Map",
             "Waypoints Always Visible", "Scaffolds Always Visible", "Contig Name Labels",
             "Scale Bars", "Grid", "ID Bars", "Tool Tip", "Invert Mouse Buttons",
-            "Gamma Min", "Gamma Mid", "Gamma Max", "Default Gamma", "Colour Maps", "Background",
+            "Gamma Min", "Gamma Mid", "Gamma Max", "Default Gamma",
+            "Left / Right: Gamma mid    Up / Down: colour map",
+            "Colour Maps", "Background",
         ];
         expected.extend(NAMES.iter().copied());
         expected.extend(BACKGROUNDS.iter().map(|(name, _)| *name));
@@ -2046,6 +2153,70 @@ mod viewer_tests {
         assert_eq!(app.session.mode, Mode::Normal);
         assert_eq!(app.session.save_json(), before);
         assert!(!app.show_view);
+    }
+
+    #[test]
+    fn arrow_keys_match_pretextview_gamma_and_colour_map() {
+        let ctx = egui::Context::default();
+        let mut app = PretextApp::initial_state();
+        let start = app.session.colormap;
+        let _ = ctx.run(input(vec![key_event(egui::Key::ArrowRight, egui::Modifiers::NONE)]), |ctx| {
+            app.keys(ctx);
+        });
+        assert!((app.session.gamma[1] - 0.55).abs() < 1e-4);
+        let _ = ctx.run(input(vec![key_event(egui::Key::ArrowLeft, egui::Modifiers::NONE)]), |ctx| {
+            app.keys(ctx);
+        });
+        assert!((app.session.gamma[1] - 0.50).abs() < 1e-4);
+
+        app.session.gamma = [0.2, 0.2, 0.8];
+        let _ = ctx.run(input(vec![key_event(egui::Key::ArrowLeft, egui::Modifiers::NONE)]), |ctx| {
+            app.keys(ctx);
+        });
+        assert!((app.session.gamma[1] - 0.2).abs() < 1e-4);
+        app.session.gamma = [0.2, 0.8, 0.8];
+        let _ = ctx.run(input(vec![key_event(egui::Key::ArrowRight, egui::Modifiers::NONE)]), |ctx| {
+            app.keys(ctx);
+        });
+        assert!((app.session.gamma[1] - 0.8).abs() < 1e-4);
+
+        let _ = ctx.run(input(vec![key_event(egui::Key::ArrowUp, egui::Modifiers::NONE)]), |ctx| {
+            app.keys(ctx);
+        });
+        assert_eq!(app.session.colormap, (start + 1) % NAMES.len());
+        let _ = ctx.run(input(vec![key_event(egui::Key::ArrowDown, egui::Modifiers::NONE)]), |ctx| {
+            app.keys(ctx);
+        });
+        assert_eq!(app.session.colormap, start);
+        app.session.colormap = 0;
+        let _ = ctx.run(input(vec![key_event(egui::Key::ArrowDown, egui::Modifiers::NONE)]), |ctx| {
+            app.keys(ctx);
+        });
+        assert_eq!(app.session.colormap, NAMES.len() - 1);
+    }
+
+    #[test]
+    fn arrow_keys_leave_gamma_alone_while_typing() {
+        let ctx = egui::Context::default();
+        let mut app = PretextApp::initial_state();
+        let _ = ctx.run(input(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.text_edit_singleline(&mut app.map_url).request_focus();
+            });
+        });
+        let gamma = app.session.gamma[1];
+        let map = app.session.colormap;
+        let _ = ctx.run(input(vec![
+            key_event(egui::Key::ArrowRight, egui::Modifiers::NONE),
+            key_event(egui::Key::ArrowUp, egui::Modifiers::NONE),
+        ]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.text_edit_singleline(&mut app.map_url);
+            });
+            app.keys(ctx);
+        });
+        assert_eq!(app.session.gamma[1], gamma);
+        assert_eq!(app.session.colormap, map);
     }
 
     #[test]
@@ -2160,6 +2331,19 @@ mod viewer_tests {
         assert_eq!(app.session.map_pixels, 4);
         assert!(app.status.contains("Loaded tiny.PRETEXT"), "{}", app.status);
         assert!(!app.status.contains("pick it up"));
+    }
+
+    #[test]
+    fn a_zoomed_out_view_is_not_covered_by_the_old_close_up() {
+        assert!(detail_covers(-0.1, -0.1, 0.1, 0.1, -0.05, -0.05, 0.05, 0.05));
+        assert!(!detail_covers(-0.1, -0.1, 0.1, 0.1, -0.4, -0.4, 0.4, 0.4));
+    }
+
+    #[test]
+    fn detail_grid_is_one_texel_per_device_pixel() {
+        assert_eq!(detail_resolution(800.0, 600.0, 2.0), (1600, 1200));
+        assert_eq!(detail_resolution(2000.0, 100.0, 2.0).0, 2048);
+        assert_eq!(detail_resolution(400.0, 400.0, 1.0), (400, 400));
     }
 
     #[test]
