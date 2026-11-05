@@ -903,40 +903,41 @@ impl PretextApp {
         let span_x = (x1 - x0).abs() * map;
         let span_y = (y1 - y0).abs() * map;
         let wants = self.session.wants_detail(view_min, span_x, span_y);
-        // The close-up is only for the current window. Once the view is far
-        // enough that the overview is the right resolution, drop it so that
-        // rectangle does not stay sharp on top of the zoomed-out map.
-        if !wants && !pointer_down && self.loader.is_none() {
-            self.detail = None;
-        }
-        if pointer_down || self.loader.is_some() || !wants {
-            return;
-        }
         let near = view.world_to_screen(self.session.camera, Vec2::new(x0, y0));
         let far = view.world_to_screen(self.session.camera, Vec2::new(x1, y1));
         let (cols, rows) = detail_resolution(far.x - near.x, far.y - near.y, ppp);
-        let window = [
-            quant(x0),
-            quant(y0),
-            quant(x1),
-            quant(y1),
-        ];
+        // Draw past the screen so a drag stays inside the close-up. The strip
+        // that used to fall off that image was the magnified overview.
+        let (px0, py0, px1, py1, pc, pr) = padded_detail(x0, y0, x1, y1, cols, rows);
+        let window = [quant(px0), quant(py0), quant(px1), quant(py1)];
+        let covers = self.detail.as_ref().is_some_and(|detail| {
+            detail.key == key && detail_covers(detail.x0, detail.y0, detail.x1, detail.y1, x0, y0, x1, y1)
+        });
+        if pointer_down && covers {
+            return;
+        }
+        if !wants && !pointer_down && self.loader.is_none() {
+            self.detail = None;
+        }
+        if self.loader.is_some() || !wants {
+            return;
+        }
         if self.detail.as_ref().is_some_and(|detail| {
-            detail.key == key && detail.window == window && detail.cols == cols && detail.rows == rows
+            detail.key == key && detail.window == window && detail.cols == pc && detail.rows == pr
         }) {
             return;
         }
         let settled = self.detail.as_ref().map(|detail| detail.key) == Some(key);
-        if settled && self.detail_at.elapsed() < Duration::from_millis(150) {
+        if covers && settled && self.detail_at.elapsed() < Duration::from_millis(150) {
             ctx.request_repaint_after(Duration::from_millis(150));
             return;
         }
-        let rgba = self.session.raster_window(x0, y0, x1, y1, cols, rows);
-        let pixels = (cols as usize) * (rows as usize) * 4;
+        let rgba = self.session.raster_window(px0, py0, px1, py1, pc, pr);
+        let pixels = (pc as usize) * (pr as usize) * 4;
         if rgba.len() != pixels {
             return;
         }
-        let image = egui::ColorImage::from_rgba_unmultiplied([cols as usize, rows as usize], &rgba);
+        let image = egui::ColorImage::from_rgba_unmultiplied([pc as usize, pr as usize], &rgba);
         let tex = if let Some(detail) = &mut self.detail {
             detail.tex.set(image, egui::TextureOptions::NEAREST);
             detail.tex.clone()
@@ -944,12 +945,12 @@ impl PretextApp {
             ctx.load_texture("contact-detail", image, egui::TextureOptions::NEAREST)
         };
         self.detail = Some(Detail {
-            x0,
-            y0,
-            x1,
-            y1,
-            cols,
-            rows,
+            x0: px0,
+            y0: py0,
+            x1: px1,
+            y1: py1,
+            cols: pc,
+            rows: pr,
             key,
             window,
             tex,
@@ -1193,9 +1194,8 @@ impl PretextApp {
         }
         if let Some(detail) = &self.detail {
             let (x0, y0, x1, y1) = view.visible_world(self.session.camera);
-            // A zoom-out makes the visible map larger than the close-up. Keep
-            // that image only while it still covers the whole view, so the old
-            // rectangle is not drawn during the short wait for the next frame.
+            // Only the part of the screen this image still covers. A shifted
+            // close-up must not leave a magnified overview beside it.
             if detail.key == tex_key(&self.session)
                 && detail_covers(detail.x0, detail.y0, detail.x1, detail.y1, x0, y0, x1, y1)
             {
@@ -1906,10 +1906,34 @@ fn quant(value: f32) -> i32 {
     (value * 10_000.0).round() as i32
 }
 
-/// The close-up still covers the visible map. A zoom-out grows the visible
-/// span past the stored rectangle and must not keep painting it.
+/// The close-up rectangle still contains the visible window.
 fn detail_covers(dx0: f32, dy0: f32, dx1: f32, dy1: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> bool {
     quant(x0) >= quant(dx0) && quant(y0) >= quant(dy0) && quant(x1) <= quant(dx1) && quant(y1) <= quant(dy1)
+}
+
+/// Grow the close-up past the screen, without dropping below one sample per
+/// visible pixel. Dragging inside that margin never uncovers the overview.
+fn padded_detail(x0: f32, y0: f32, x1: f32, y1: f32, cols: u32, rows: u32) -> (f32, f32, f32, f32, u32, u32) {
+    const MAX_SIDE: f32 = 2048.0;
+    let cols = cols.max(2);
+    let rows = rows.max(2);
+    let (x0, x1) = (x0.min(x1), x0.max(x1));
+    let (y0, y1) = (y0.min(y1), y0.max(y1));
+    let span_x = (x1 - x0).max(1e-6);
+    let span_y = (y1 - y0).max(1e-6);
+    let density_x = cols as f32 / span_x;
+    let density_y = rows as f32 / span_y;
+    let max_span_x = MAX_SIDE / density_x;
+    let max_span_y = MAX_SIDE / density_y;
+    let pad_x = ((span_x * 2.0).min(max_span_x) - span_x).max(0.0) * 0.5;
+    let pad_y = ((span_y * 2.0).min(max_span_y) - span_y).max(0.0) * 0.5;
+    let px0 = (x0 - pad_x).clamp(-0.5, 0.5);
+    let py0 = (y0 - pad_y).clamp(-0.5, 0.5);
+    let px1 = (x1 + pad_x).clamp(-0.5, 0.5);
+    let py1 = (y1 + pad_y).clamp(-0.5, 0.5);
+    let pc = ((px1 - px0) * density_x).round().clamp(2.0, MAX_SIDE) as u32;
+    let pr = ((py1 - py0) * density_y).round().clamp(2.0, MAX_SIDE) as u32;
+    (px0, py0, px1, py1, pc, pr)
 }
 
 /// One contact sample per device pixel, so zooming in reveals a finer mip
@@ -2334,9 +2358,14 @@ mod viewer_tests {
     }
 
     #[test]
-    fn a_zoomed_out_view_is_not_covered_by_the_old_close_up() {
-        assert!(detail_covers(-0.1, -0.1, 0.1, 0.1, -0.05, -0.05, 0.05, 0.05));
-        assert!(!detail_covers(-0.1, -0.1, 0.1, 0.1, -0.4, -0.4, 0.4, 0.4));
+    fn a_drag_stays_inside_the_padded_close_up() {
+        let (px0, py0, px1, py1, cols, _) = padded_detail(-0.1, -0.1, 0.1, 0.1, 400, 400);
+        assert!(detail_covers(px0, py0, px1, py1, -0.1, -0.1, 0.1, 0.1));
+        assert!(detail_covers(px0, py0, px1, py1, -0.05, -0.1, 0.15, 0.1));
+        assert!(!detail_covers(px0, py0, px1, py1, -0.4, -0.4, 0.4, 0.4));
+        assert!(cols <= 2048);
+        let visible = cols as f32 * 0.2 / (px1 - px0);
+        assert!(visible > 390.0, "visible samples fell to {visible}");
     }
 
     #[test]
